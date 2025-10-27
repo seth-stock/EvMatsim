@@ -24,7 +24,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-
+import org.matsim.contrib.rlev.RewardProbe;
 public class OCPRewardServer {
 
     private final BlockingQueue<RequestData> requestQueue = new LinkedBlockingQueue<>();
@@ -106,11 +106,11 @@ public class OCPRewardServer {
                     Config runCfg = ConfigUtils.loadConfig(configPath.toString());
 
                     // --- SPEEDUPS: keep I/O & work minimal for server-side runs ---
-                    runCfg.controller().setLastIteration(0);
-                    runCfg.controller().setWriteEventsInterval(0);
-                    runCfg.controller().setWritePlansInterval(0);
-                    runCfg.controller().setCreateGraphs(false);
-                    runCfg.controller().setDumpDataAtEnd(false);
+                    runCfg.controler().setLastIteration(0);
+                    runCfg.controler().setWriteEventsInterval(0);
+                    runCfg.controler().setWritePlansInterval(0);
+                    runCfg.controler().setCreateGraphs(false);
+                    runCfg.controler().setDumpDataAtEnd(false);
                     // Deterministic + lighter on Windows:
                     runCfg.qsim().setNumberOfThreads(1);
                     runCfg.global().setNumberOfThreads(1);
@@ -119,12 +119,14 @@ public class OCPRewardServer {
 
                     Controler controler = new Controler(runCfg);
                     // Bind probe (as ControlerListener + EventHandler)
-                    controler.addOverridingModule(new com.google.inject.AbstractModule() {
-                        @Override protected void configure() {
+                    controler.addOverridingModule(new org.matsim.core.controler.AbstractModule() {
+                        @Override
+                        public void install() {
                             addControlerListenerBinding().toInstance(probe);
                             addEventHandlerBinding().toInstance(probe);
                         }
                     });
+
 
                     controler.run();
                     log.println("=== MATSim run completed ===");

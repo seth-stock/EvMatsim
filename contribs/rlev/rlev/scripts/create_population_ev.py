@@ -153,8 +153,7 @@ def create_population_and_plans_xml_counts(
                 type="h",
                 x=str(dest_node[0]),
                 y=str(dest_node[1]),
-                start_time=start_time_str,
-                end_time=end_time_str,
+                start_time=end_time_str,
             )
 
     vehicle_tree = create_vehicle_definitions(person_ids, initial_soc)
@@ -228,3 +227,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args)
+
+
+
+

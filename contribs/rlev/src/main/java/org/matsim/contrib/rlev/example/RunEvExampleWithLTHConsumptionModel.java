@@ -89,7 +89,7 @@ public class RunEvExampleWithLTHConsumptionModel {
 
 	public void run(String[] args) {
 		Config config = ConfigUtils.loadConfig(args, new EvConfigGroup());
-		config.controller()
+		config.controler()
 				.setOverwriteFileSetting(OutputDirectoryHierarchy.OverwriteFileSetting.deleteDirectoryIfExists);
 
 		// ===

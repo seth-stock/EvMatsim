@@ -9,8 +9,8 @@ class MatsimGraphEnvMlp(MatsimGraphEnv):
     A custom Gymnasium environment for Matsim graph-based simulations.
     """
 
-    def __init__(self, config_path, num_agents=100, save_dir=None):
-        super().__init__(config_path, num_agents, save_dir)
+    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python"):
+        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend)
 
         self.observation_space = spaces.Box(
             low=0,

@@ -79,7 +79,7 @@ public class RunEvExampleWithOwnConsumptionModel{
 		System.setProperty("matsim.preferLocalDtds", "true");
 
 		Config config = ConfigUtils.loadConfig(args, new EvConfigGroup());
-		config.controller().setOverwriteFileSetting(OutputDirectoryHierarchy.OverwriteFileSetting.deleteDirectoryIfExists);
+		config.controler().setOverwriteFileSetting(OutputDirectoryHierarchy.OverwriteFileSetting.deleteDirectoryIfExists);
 
 		// ===
 

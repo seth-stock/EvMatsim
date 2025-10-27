@@ -35,6 +35,9 @@ class MatsimXMLDataset(Dataset):
     ):
         super().__init__(transform=None)
 
+        # Remember original scenario directory (for optional output export)
+        self.original_scenario_dir = Path(config_path).resolve().parent
+
         # Windows-safe temp root; ensure a clean sandbox
         tmp_dir = Path(tempfile.gettempdir()) / time_string
         if tmp_dir.exists():
@@ -43,6 +46,9 @@ class MatsimXMLDataset(Dataset):
         output_path = tmp_dir / "output"
 
         shutil.copytree(config_path.parent, tmp_dir)
+        if output_path.exists():
+            shutil.rmtree(output_path, ignore_errors=True)
+        output_path.mkdir(parents=True, exist_ok=True)
         self.config_path = tmp_dir / config_path.name
 
         (
@@ -252,6 +258,30 @@ class MatsimXMLDataset(Dataset):
 
         self.charger_cost = cost
         return cost
+
+    def get_average_energy_capacity(self, vehicles_path: Path) -> float:
+        """Return the average vehicle energy capacity in kWh (fallback=1)."""
+        try:
+            tree = self._parse_xml(Path(vehicles_path))
+        except Exception:
+            return 1.0
+
+        ns = {"m": "http://www.matsim.org/files/dtd"}
+        capacities: list[float] = []
+        root = tree.getroot()
+        for vtype in root.findall(".//m:vehicleType", ns):
+            engine_attrs = vtype.find("m:engineInformation/m:attributes", ns)
+            if engine_attrs is None:
+                continue
+            for attr in engine_attrs.findall("m:attribute", ns):
+                if attr.get("name") == "energyCapacityInKWhOrLiters":
+                    try:
+                        capacities.append(float(attr.text))
+                    except (TypeError, ValueError):
+                        pass
+        if not capacities:
+            return 1.0
+        return sum(capacities) / len(capacities)
 
     def get_graph(self):
         return self.graph

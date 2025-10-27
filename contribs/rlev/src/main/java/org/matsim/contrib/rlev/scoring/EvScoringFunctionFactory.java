@@ -12,7 +12,7 @@ import org.matsim.core.scoring.functions.CharyparNagelAgentStuckScoring;
 import org.matsim.core.scoring.functions.ScoringParametersForPerson;
 import org.matsim.core.scoring.functions.SubpopulationScoringParameters;
 
-import jakarta.inject.Inject;
+import com.google.inject.Inject;
 
 public class EvScoringFunctionFactory implements ScoringFunctionFactory {
 

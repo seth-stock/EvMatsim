@@ -1,8 +1,9 @@
-import xml.etree.ElementTree as ET
+﻿import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
+from pathlib import Path
 
 
 def get_link_ids(network_file):
@@ -38,6 +39,10 @@ def setup_config(config_xml_path, output_dir, num_iterations=0):
 
     network_file, plans_file, vehicles_file, chargers_file, counts_file = None, None, None, None, None
 
+    def _normalize_path(value: str) -> str:
+        path_obj = Path(value)
+        return path_obj.name if path_obj.is_absolute() else value
+
     for module in root.findall(".//module"):
         for param in module.findall("param"):
             if param.get("name") == "lastIteration":
@@ -45,15 +50,27 @@ def setup_config(config_xml_path, output_dir, num_iterations=0):
             if param.get("name") == "outputDirectory":
                 param.set("value", output_dir)
             if param.get("name") == "inputNetworkFile":
-                network_file = param.get("value")
+                value = _normalize_path(param.get("value"))
+                param.set("value", value)
+                network_file = value
             if param.get("name") == "inputPlansFile":
-                plans_file = param.get("value")
+                value = _normalize_path(param.get("value"))
+                param.set("value", value)
+                plans_file = value
             if param.get("name") == "vehiclesFile":
-                vehicles_file = param.get("value")
+                value = _normalize_path(param.get("value"))
+                param.set("value", value)
+                vehicles_file = value
             if param.get("name") == "chargersFile":
-                chargers_file = param.get("value")
+                value = _normalize_path(param.get("value"))
+                param.set("value", value)
+                chargers_file = value
             if param.get("name") == "inputCountsFile":
-                counts_file = param.get("value")
+                value = _normalize_path(param.get("value"))
+                param.set("value", value)
+                counts_file = value
+            if module.get("name") == "ev" and param.get("name") in ("timeProfiles", "chargerPowerTimeProfiles"):
+                param.set("value", "true")
 
     with open(config_xml_path, "wb") as f:
         f.write(b'<?xml version="1.0" ?>\n')
@@ -281,3 +298,5 @@ def extract_paths_from_config(config_xml_path):
         chargers_file,
         q_values_file,
     )
+
+

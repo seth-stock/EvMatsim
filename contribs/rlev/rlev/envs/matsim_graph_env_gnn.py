@@ -10,7 +10,7 @@ class MatsimGraphEnvGNN(MatsimGraphEnv):
     with GNNs. It supports multi-agent actions and observations.
     """
 
-    def __init__(self, config_path, num_agents=100, save_dir=None):
+    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python"):
         """
         Initialize the environment.
 
@@ -19,7 +19,7 @@ class MatsimGraphEnvGNN(MatsimGraphEnv):
             num_agents (int): Number of agents in the environment.
             save_dir (str): Directory to save outputs.
         """
-        super().__init__(config_path, num_agents, save_dir)
+        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend)
 
         self.observation_space: spaces.Dict = spaces.Dict(
             spaces=dict(x=self.x, edge_index=self.edge_index_space)

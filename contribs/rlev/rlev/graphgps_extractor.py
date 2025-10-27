@@ -38,14 +38,28 @@ class LocalGlobalBlock(nn.Module):
 
     def forward(self, x_flat: torch.Tensor, edge_index: torch.Tensor, B: int, K: int) -> torch.Tensor:
         # x_flat: (B*K, D)
-        x = self.norm1(x_flat)
-        h = self.local(x, edge_index)                 # (B*K, D)
-        x = x + self.drop(h)                          # residual after local
-        xd = x.view(B, K, -1)                         # (B, K, D) dense tokens for attention
-        y, _ = self.attn(xd, xd, xd, need_weights=False)  # (B, K, D)
-        y = y.reshape(B * K, -1)
-        x = self.norm2(x + self.drop(y))              # residual after global
-        return x
+        dtype = x_flat.dtype
+
+        # Run LayerNorm in fp32 for numerical stability, then project back
+        x_norm = self.norm1(x_flat.to(torch.float32)).to(dtype)
+
+        # Local message passing (always eval in fp32 to avoid half precision NaNs)
+        local_in = x_norm.to(torch.float32)
+        h = self.local(local_in, edge_index).to(dtype)  # (B*K, D)
+        x = x_norm + self.drop(h)                       # residual after local
+
+        # Global attention: compute scores in fp32 to avoid softmax overflow
+        tokens = x.view(B, K, -1)
+        attn_in = tokens.to(torch.float32)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        y = attn_out.to(dtype).reshape(B * K, -1)
+
+        # Second residual + LayerNorm (again keep fp32 inside the norm)
+        x = x + self.drop(y)
+        x = self.norm2(x.to(torch.float32)).to(dtype)
+
+        # Clamp any remaining NaNs/Infs that could arise from fp16 overflows
+        return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
 
 
 class GraphGPSExtractor(BaseFeaturesExtractor):
@@ -73,6 +87,7 @@ class GraphGPSExtractor(BaseFeaturesExtractor):
         self.fixed_k = int(fixed_k)
         self.use_amp = bool(use_amp)
         self._want_cudagraphs = bool(use_cudagraphs)
+        self._amp_warned = False
 
         in_dim = int(observation_space["nodes"].shape[-1])  # type: ignore[attr-defined]
         self.in_proj = nn.Identity() if in_dim == self.embed_dim else nn.Linear(in_dim, self.embed_dim)
@@ -133,23 +148,35 @@ class GraphGPSExtractor(BaseFeaturesExtractor):
         return Data(x=x_flat, edge_index=self._batched_ei, batch=self._batch_vec)
 
     # ---------- forward (no capture) ----------
-    def _stack_forward(self, data: Data) -> torch.Tensor:
-    # Mixed precision for the whole stack (no deprecation warning)
-        with torch.amp.autocast(device_type="cuda", enabled=self.use_amp and data.x.is_cuda):
+    def _stack_forward(self, data: Data, *, check_amp: bool = True) -> torch.Tensor:
+        amp_enabled = self.use_amp and data.x.is_cuda
+
+        def _forward_once():
             x = self.in_proj(data.x)  # (B*K, D)
             B = self._B
             K = self._sel_idx.numel()
 
-        # Local+global blocks (capture-safe)
             for block in self.blocks:
                 x = block(x, data.edge_index, B=B, K=K)  # (B*K, D)
 
-        # <<< IMPORTANT: capture-safe pooling (no PyG scatter, no host sync) >>>
-        # We know shapes are fixed: x is (B*K, D). Just reshape and average tokens.
             g = x.view(B, K, -1).mean(dim=1).contiguous()  # (B, D)
-            g = self.out_norm(g)
+            return self.out_norm(g)
 
-        return g.float()
+        with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+            g = _forward_once()
+
+        g_float = g.float()
+        if check_amp and amp_enabled and not torch.isfinite(g_float).all():
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                g = _forward_once()
+            g_float = g.float()
+            if not self._amp_warned:
+                print("[GraphGPSExtractor] AMP produced NaNs; falling back to fp32.", flush=True)
+                self._amp_warned = True
+            self.use_amp = False
+
+        g_float = torch.nan_to_num(g_float, nan=0.0, posinf=1e4, neginf=-1e4)
+        return g_float
 
 
     # ---------- capture ----------
@@ -174,7 +201,7 @@ class GraphGPSExtractor(BaseFeaturesExtractor):
         torch.cuda.current_stream(device).wait_stream(self._capture_stream)
         with torch.cuda.stream(self._capture_stream):
             with torch.cuda.graph(g):
-                out = self._stack_forward(self._assemble_data_from_static())
+                out = self._stack_forward(self._assemble_data_from_static(), check_amp=False)
                 self._static_out.copy_(out)
         torch.cuda.current_stream(device).wait_stream(self._capture_stream)
 
@@ -198,4 +225,5 @@ class GraphGPSExtractor(BaseFeaturesExtractor):
             self._graph.replay()
             return self._static_out
         else:
-            return self._stack_forward(self._assemble_data_from_static())
+            return self._stack_forward(self._assemble_data_from_static(), check_amp=True)
+

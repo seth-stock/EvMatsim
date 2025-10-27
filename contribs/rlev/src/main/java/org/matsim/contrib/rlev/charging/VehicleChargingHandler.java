@@ -25,7 +25,7 @@ package org.matsim.contrib.rlev.charging;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableListMultimap;
-import jakarta.inject.Inject;
+import com.google.inject.Inject;
 import org.matsim.api.core.v01.Id;
 import org.matsim.api.core.v01.events.ActivityEndEvent;
 import org.matsim.api.core.v01.events.ActivityStartEvent;
@@ -47,7 +47,7 @@ import org.matsim.contrib.rlev.fleet.ElectricVehicle;
 import org.matsim.contrib.rlev.infrastructure.Charger;
 import org.matsim.contrib.rlev.infrastructure.ChargingInfrastructure;
 import org.matsim.contrib.rlev.infrastructure.ChargingInfrastructureUtils;
-import org.matsim.core.config.groups.ScoringConfigGroup;
+import org.matsim.core.config.groups.PlanCalcScoreConfigGroup;
 import org.matsim.core.events.MobsimScopeEventHandler;
 import org.matsim.core.mobsim.framework.MobsimAgent;
 import org.matsim.core.mobsim.framework.events.MobsimBeforeSimStepEvent;
@@ -75,7 +75,7 @@ public class VehicleChargingHandler
 	MobsimBeforeSimStepListener, MobsimScopeEventHandler, LinkEnterEventHandler, LinkLeaveEventHandler {
 
 	public static final String CHARGING_IDENTIFIER = " charging";
-	public static final String CHARGING_INTERACTION = ScoringConfigGroup.createStageActivityType(
+	public static final String CHARGING_INTERACTION = PlanCalcScoreConfigGroup.createStageActivityType(
 			CHARGING_IDENTIFIER);
 	/*
 	 * actually this set is not needed as long as driver id's equal the vehicle id's. Because the internal id handling would sort that out

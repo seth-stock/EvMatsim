@@ -9,19 +9,26 @@ import org.matsim.core.config.ConfigUtils;
 import org.matsim.core.controler.AbstractModule;
 import org.matsim.core.mobsim.qsim.components.QSimComponentsConfigGroup;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class EvBaseModule extends AbstractModule {
-	public void install(){
-		install(new ElectricFleetModule() );
-		install(new ChargingInfrastructureModule() );
-		install(new ChargingModule() );
-		install(new DischargingModule() );
-		install(new EvStatsModule() );
-		{
-			// this switches on all the QSimComponents that are registered at various places under EvModule.EV_Component.
-			ConfigUtils.addOrGetModule( this.getConfig(), QSimComponentsConfigGroup.class ).addActiveComponent( EvModule.EV_COMPONENT );
+	@Override
+	public void install() {
+		install(new ElectricFleetModule());
+		install(new ChargingInfrastructureModule());
+		install(new ChargingModule());
+		install(new DischargingModule());
+		install(new EvStatsModule());
+
+		// Switch on all EV QSim components registered under EvModule.EV_COMPONENT
+		QSimComponentsConfigGroup qsimCfg =
+				ConfigUtils.addOrGetModule(getConfig(), QSimComponentsConfigGroup.class);
+
+		List<String> activeComponents = new ArrayList<>(qsimCfg.getActiveComponents());
+		if (!activeComponents.contains(EvModule.EV_COMPONENT)) {
+			activeComponents.add(EvModule.EV_COMPONENT);
+			qsimCfg.setActiveComponents(activeComponents);
 		}
 	}
-
 }

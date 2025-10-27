@@ -1,12 +1,9 @@
 """
-This script implements a reinforcement learning (RL) training pipeline using
-the Proximal Policy Optimization (PPO) algorithm from the Stable-Baselines3
-library. The training is performed on custom Matsim-based environments, which
-can use an MLP, a GNN, or a GraphGPS encoder as the policy backbone.
+PPO training runner for MATSim-based envs (MLP/GNN/GraphGPS).
 
-It supports parallelized environments, custom callbacks for TensorBoard logging
-and checkpointing, and configurable hyperparameters. It also allows resuming
-training from a previously saved model.
+Non-optional Fix C:
+- Add --backend flag and force it via RLEV_BACKEND env var so the Python env
+  runs fully local when requested (no HTTP server unless you choose --backend server).
 """
 
 import argparse
@@ -22,16 +19,65 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-# Optional imports only used for type hints/logging of best env
+# Type-only imports for hints/logging
 from rlev.envs.matsim_graph_env_gnn import MatsimGraphEnvGNN  # noqa: F401
 from rlev.envs.matsim_graph_env_mlp import MatsimGraphEnvMlp  # noqa: F401
 
-# GraphGPS extractor (ensure this file exists: rlev/models/graphgps_extractor.py)
+# GraphGPS extractor (your file lives next to this script)
 from .graphgps_extractor import GraphGPSExtractor
+
+# --- Guard for CUDA tensor actions in this SB3 fork ---
+try:
+    from stable_baselines3.common import buffers as _sb3_buf
+    _orig_add = _sb3_buf.RolloutBuffer.add
+
+    def _add_guard(self, obs, actions, *args, **kwargs):
+        # Some forks pass torch tensors for actions; make sure we store numpy
+        import numpy as _np
+        import torch as _th
+        if isinstance(actions, _th.Tensor):
+            actions = actions.detach().cpu().numpy()
+        else:
+            # if it's a list/tuple of tensors (multi-discrete can be vector)
+            if isinstance(actions, (list, tuple)):
+                actions = _np.asarray([
+                    a.detach().cpu().numpy() if isinstance(a, _th.Tensor) else a
+                    for a in actions
+                ])
+        return _orig_add(self, obs, actions, *args, **kwargs)
+
+    _sb3_buf.RolloutBuffer.add = _add_guard  # monkeypatch
+except Exception as _e:
+    print(f"[rollout-buffer-guard] non-fatal: {_e}", flush=True)
+
+
+
+# --- SB3 rollout buffer patch: ensure actions are numpy on CPU ---------------
+from stable_baselines3.common.buffers import RolloutBuffer as _RB
+import inspect as _inspect
+
+if not getattr(_RB, "_rlev_patched", False):
+    _RB__add_orig = _RB.add
+
+    def _rlev_add(self, obs, action, reward, episode_start, value, log_prob):
+        # Coerce action to numpy on CPU if it is a torch.Tensor
+        try:
+            import torch as _th
+            if isinstance(action, _th.Tensor):
+                action = action.detach().cpu().numpy()
+        except Exception:
+            pass
+        return _RB__add_orig(self, obs, action, reward, episode_start, value, log_prob)
+
+    # Verify signature matches (defensive)
+    if len(_inspect.signature(_RB.add).parameters) == 6:
+        _RB.add = _rlev_add
+        _RB._rlev_patched = True
+# ---------------------------------------------------------------------------
+
 
 def _print_cuda_diag():
     try:
-        import torch
         info = dict(
             cuda_available=torch.cuda.is_available(),
             torch_cuda=torch.version.cuda,
@@ -45,29 +91,26 @@ def _print_cuda_diag():
 
 
 class TensorboardCallback(BaseCallback):
-    """
-    Logs average metrics and keeps track of the best-performing env snapshot.
-    Expects each env to put {"graph_env_inst": <env_instance>} into info dicts.
-    """
+    """Log averages and persist best snapshot. Expects info['graph_env_inst'] per env step."""
 
     def __init__(self, verbose: int = 0, save_dir: str | None = None):
         super().__init__(verbose)
         self.save_dir = save_dir
         self.best_reward = -np.inf
-        # Keep the type annotation loose to support all env wrappers (MLP/GNN/GPS)
         self.best_env: Any = None
 
     def _on_step(self) -> bool:
+        infos_list = self.locals.get("infos", []) or []
+        if not infos_list:
+            return True
+
         avg_reward = 0.0
         avg_cost = 0.0
         avg_charger_eff = 0.0
         avg_time_eff = 0.0
 
-        infos_list = self.locals.get("infos", [])
-        n = len(infos_list) if infos_list else 0
-
-        for i, infos in enumerate(infos_list):
-            env_inst = infos.get("graph_env_inst", None)
+        for infos in infos_list:
+            env_inst = infos.get("graph_env_inst")
             if env_inst is None:
                 continue
 
@@ -80,111 +123,94 @@ class TensorboardCallback(BaseCallback):
             if reward > self.best_reward:
                 self.best_reward = reward
                 self.best_env = env_inst
-                # Persist best snapshot
                 if self.save_dir is not None:
                     self.best_env.save_charger_config_to_csv(Path(self.save_dir, "best_chargers.csv"))
                     if getattr(self.best_env, "best_output_response", None) is not None:
                         self.best_env.save_server_output(self.best_env.best_output_response, "bestoutput")
 
-        if n > 0:
-            self.logger.record("metrics/avg_reward", avg_reward / n)
-            self.logger.record("metrics/best_reward", self.best_reward)
-            self.logger.record("metrics/avg_charger_cost", avg_cost / n)
-            self.logger.record("metrics/avg_charger_efficiency", avg_charger_eff / n)
-            self.logger.record("metrics/avg_time_efficiency", avg_time_eff / n)
-
+        n = max(1, len(infos_list))
+        self.logger.record("metrics/avg_reward", avg_reward / n)
+        self.logger.record("metrics/best_reward", self.best_reward)
+        self.logger.record("metrics/avg_charger_cost", avg_cost / n)
+        self.logger.record("metrics/avg_charger_efficiency", avg_charger_eff / n)
+        self.logger.record("metrics/avg_time_efficiency", avg_time_eff / n)
         return True
 
 
 def main(args: argparse.Namespace):
-    # Output directory for this run
+    # ---------- Fix C: force backend selection ----------
+    os.environ["RLEV_BACKEND"] = args.backend  # consumed by MatsimGraphEnv*
+    print(f"[ENV] RLEV_BACKEND={os.environ['RLEV_BACKEND']}", flush=True)
+
+    # ---------- Output dir ----------
     save_dir = f"{args.results_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}/"
     os.makedirs(save_dir, exist_ok=True)
 
-    # Persist CLI args for reproducibility
     with open(Path(save_dir, "args.txt"), "w") as f:
-        for key, val in vars(args).items():
-            f.write(f"{key}:{val}\n")
+        for k, v in vars(args).items():
+            f.write(f"{k}:{v}\n")
 
-    # --------- Env factory ---------
+    # ---------- Env factory ----------
     def make_env():
+        make_kwargs = dict(
+            config_path=args.matsim_config,
+            num_agents=args.num_agents,
+            save_dir=save_dir,
+            backend=args.backend,           # <<< force the backend into the env
+        )
         if args.policy_type == "MlpPolicy":
-            return gym.make(
-                "MatsimGraphEnvMlp-v0",
-                config_path=args.matsim_config,
-                num_agents=args.num_agents,
-                save_dir=save_dir,
-            )
+            return gym.make("MatsimGraphEnvMlp-v0", **make_kwargs)
         elif args.policy_type == "GNNPolicy":
-            return gym.make(
-                "MatsimGraphEnvGNN-v0",
-                config_path=args.matsim_config,
-                num_agents=args.num_agents,
-                save_dir=save_dir,
-            )
+            return gym.make("MatsimGraphEnvGNN-v0", **make_kwargs)
         elif args.policy_type == "GraphGPS":
-            # Requires your GraphGPS env wrapper to be registered as MatsimGraphEnvGPS-v0
-            return gym.make(
-                "MatsimGraphEnvGPS-v0",
-                config_path=args.matsim_config,
-                num_agents=args.num_agents,
-                save_dir=save_dir,
-                pe_dim=0,  # set >0 once you add positional encodings
-            )
+            return gym.make("MatsimGraphEnvGPS-v0", **make_kwargs)
         else:
             raise ValueError(f"Unknown policy_type: {args.policy_type}")
 
-    # Windows-friendly vectorized env (threads, not processes)
+    # Windows-friendly (no subprocess fork)
     env = DummyVecEnv([make_env for _ in range(args.num_envs)])
 
-    # The save frequency only accounts for how many times each env has run,
-    # so divide to save every args.save_frequency *total* timesteps.
+    # Save frequency is per-env; scale to total steps
     args.save_frequency //= max(1, args.num_envs)
 
     tensorboard_cb = TensorboardCallback(save_dir=save_dir)
     checkpoint_cb = CheckpointCallback(save_freq=args.save_frequency, save_path=save_dir)
     callback = CallbackList([tensorboard_cb, checkpoint_cb])
 
-    # --------- Policy selection + kwargs ---------
+    # ---------- Device ----------
     _print_cuda_diag()
-
     if args.device == "cuda":
-        device_str = "cuda:0"  # will raise if CUDA is actually unavailable
+        device_str = "cuda:0"
     elif args.device == "cpu":
         device_str = "cpu"
     else:
-    # auto
         device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
-
     print(f"[RL] Using device={device_str}", flush=True)
 
-
-    # Default: MLP / legacy GNN path
-    policy_id = args.policy_type
+    # ---------- Policy + kwargs ----------
+    policy_id: str = args.policy_type
     policy_kwargs: dict[str, Any] = dict(net_arch=args.mlp_dims)
 
-    # GraphGPS path uses a custom features extractor and MultiInputPolicy
     if args.policy_type == "GraphGPS":
         policy_id = "MultiInputPolicy"
         policy_kwargs = dict(
             features_extractor_class=GraphGPSExtractor,
             features_extractor_kwargs=dict(
-                features_dim=128,
-                num_layers=3,
-                heads=4,
-                dropout=0.2,
-                attn_dropout=0.2,
-                fixed_k=128,     # lower to 48/32 if still tight on VRAM
-                use_amp=True,
-                use_cudagraphs=True,
+                features_dim=args.gps_dim,
+                num_layers=args.gps_layers,
+                heads=args.gps_heads,
+                fixed_k=args.gps_fixed_k,
+                dropout=0.1,
+                attn_dropout=0.1,
+                use_amp=bool(args.amp),
+                use_cudagraphs=bool(args.cuda_graphs),
             ),
-            net_arch=dict(pi=[128], vf=[128]),
+            # small MLP heads after extractor
+            net_arch=dict(pi=[args.gps_head], vf=[args.gps_head]),
             share_features_extractor=True,
         )
 
-
-
-    # --------- Build or load model ---------
+    # ---------- Build / load ----------
     if args.model_path:
         model = PPO.load(
             args.model_path,
@@ -210,16 +236,28 @@ def main(args: argparse.Namespace):
             clip_range=args.clip_range,
             policy_kwargs=policy_kwargs,
         )
+    # --- Force actions to CPU numpy before RolloutBuffer.add ---------------------
 
-    # Optional: enable CUDA Graphs capture for GraphGPS after warmup (fixed shapes required)
+    _rb = model.rollout_buffer
+    _orig_add = _rb.add
+
+    def _safe_add(obs, action, reward, episode_start, value, log_prob):
+        # Some forks return a torch.Tensor action on CUDA; RolloutBuffer expects numpy
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
+        return _orig_add(obs, action, reward, episode_start, value, log_prob)
+
+    _rb.add = _safe_add
+    # ----------------------------------------------------------------------------
+
+    # Optional: flip extractor flag too
     if args.policy_type == "GraphGPS" and torch.cuda.is_available():
         try:
-            model.policy.features_extractor._use_cudagraphs = True  # capture on first forward
+            model.policy.features_extractor._use_cudagraphs = bool(args.cuda_graphs)
         except Exception:
             pass
 
-    # --------- Train ---------
-    # total_timesteps = n_steps * num_envs * iterations
+    # ---------- Train ----------
     model.learn(total_timesteps=args.num_timesteps, callback=callback)
     model.save(Path(save_dir, "ppo_matsim"))
 
@@ -230,53 +268,50 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("matsim_config", type=str, help="Path to the matsim config.xml file.")
-    parser.add_argument(
-        "--num_timesteps",
-        type=int,
-        default=1_000_000,
-        help="Total number of timesteps to train. num_timesteps = n_steps * num_envs * iterations.",
-    )
-    parser.add_argument("--num_envs", type=int, default=100, help="Number of environments to run in parallel.")
-    parser.add_argument(
-        "--num_agents",
-        type=int,
-        default=-1,
-        help=(
-            "Number of vehicles to simulate in the matsim simulator. "
-            "If num_agents < 0, existing plans.xml and vehicles.xml are used."
-        ),
-    )
-    parser.add_argument(
-        "--mlp_dims",
-        default="256 128 64",
-        help="Dimensions of the MLP layers as space-separated integers (e.g., '256 128 64').",
-    )
-    parser.add_argument("--results_dir", type=str, default=Path(Path(__file__).parent, "ppo_results"),
-                        help="Directory to save TensorBoard logs and model checkpoints.")
-    parser.add_argument("--num_steps", type=int, default=1,
-                        help="Number of steps each environment takes before updating the policy/value.")
-    parser.add_argument("--batch_size", type=int, default=25,
-                        help="Batch size PPO uses when sampling from the rollout buffer for updates.")
-    parser.add_argument("--learning_rate", type=float, default=1e-5,
-                        help="Optimizer learning rate.")
-    parser.add_argument("--model_path", default=None,
-                        help="Path to a saved model.zip to resume training.")
-    parser.add_argument("--save_frequency", type=int, default=10_000,
-                        help="How often to save model weights, in *total* timesteps.")
-    parser.add_argument("--clip_range", type=float, default=0.2, help="PPO clip range.")
-    parser.add_argument(
-        "--policy_type",
-        default="MlpPolicy",
-        choices=["MlpPolicy", "GNNPolicy", "GraphGPS"],
-        type=str,
-        help="Policy type / encoder backbone.",
-    )
+    
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
-                    help="Device override. 'auto' chooses cuda if available else cpu.")
+                        help="Device override. 'auto' chooses cuda if available else cpu.")
 
-    # Parse + normalize args
+    parser.add_argument("--num_timesteps", type=int, default=1_000_000,
+                        help="Total timesteps: n_steps * num_envs * iterations.")
+    parser.add_argument("--num_envs", type=int, default=100, help="Number of parallel envs.")
+    parser.add_argument("--num_agents", type=int, default=-1,
+                        help="If < 0, use existing plans/vehicles; otherwise regenerate.")
+    parser.add_argument("--mlp_dims", default="256 128 64",
+                        help="MLP hidden sizes (space-separated).")
+    parser.add_argument("--results_dir", type=str, default=Path(Path(__file__).parent, "ppo_results"),
+                        help="Directory for TB logs and checkpoints.")
+    parser.add_argument("--num_steps", type=int, default=1,
+                        help="On-policy rollout horizon (per env).")
+    parser.add_argument("--batch_size", type=int, default=25,
+                        help="PPO minibatch size.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5,
+                        help="Optimizer LR.")
+    parser.add_argument("--model_path", default=None,
+                        help="Resume from model.zip.")
+    parser.add_argument("--save_frequency", type=int, default=10_000,
+                        help="Checkpoint frequency in *total* timesteps.")
+    parser.add_argument("--clip_range", type=float, default=0.2, help="PPO clip range.")
+    parser.add_argument("--policy_type", default="MlpPolicy",
+                        choices=["MlpPolicy", "GNNPolicy", "GraphGPS"],
+                        type=str, help="Policy / encoder backbone.")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default=os.getenv("RLEV_BACKEND", "python"),
+        choices=["python", "server", "jvm"],
+        help="Where to run MATSim from the env: 'python' (local JPype), 'jvm' (local via CLI JPype), or 'server' (HTTP).",
+    )
+
+    # GraphGPS knobs
+    parser.add_argument("--gps_dim", type=int, default=128, help="GraphGPS features_dim.")
+    parser.add_argument("--gps_layers", type=int, default=3, help="GraphGPS number of layers.")
+    parser.add_argument("--gps_heads", type=int, default=4, help="GraphGPS attention heads.")
+    parser.add_argument("--gps_fixed_k", type=int, default=128, help="Fixed K (node cap) for padding/bucketing.")
+    parser.add_argument("--gps_head", type=int, default=128, help="Size of policy/value MLP heads.")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision in extractor.")
+    parser.add_argument("--cuda_graphs", action="store_true", help="Enable CUDA Graphs in extractor.")
+
     args = parser.parse_args()
-    # Convert "256 128 64" -> [256, 128, 64]
     args.mlp_dims = [int(x) for x in str(args.mlp_dims).split()]
-    # Run
     main(args)

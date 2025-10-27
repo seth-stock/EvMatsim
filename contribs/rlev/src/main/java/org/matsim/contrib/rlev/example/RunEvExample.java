@@ -65,7 +65,7 @@ public class RunEvExample {
 
 	public void run( String[] args ) {
 		Config config = ConfigUtils.loadConfig(args, new EvConfigGroup());
-		config.controller().setOverwriteFileSetting(OutputDirectoryHierarchy.OverwriteFileSetting.deleteDirectoryIfExists);
+		config.controler().setOverwriteFileSetting(OutputDirectoryHierarchy.OverwriteFileSetting.deleteDirectoryIfExists);
 		Scenario scenario = ScenarioUtils.loadScenario(config);
 		Controler controler = new Controler(scenario);
 		controler.addOverridingModule( new AbstractModule(){

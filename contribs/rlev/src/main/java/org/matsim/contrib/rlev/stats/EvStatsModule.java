@@ -23,7 +23,7 @@ package org.matsim.contrib.rlev.stats;
 import com.google.inject.Inject;
 import com.google.inject.Provider;
 import com.google.inject.Singleton;
-import org.matsim.contrib.common.timeprofile.ProfileWriter;
+import org.matsim.contrib.rlev.stats.util.ProfileWriter;
 import org.matsim.contrib.rlev.EvConfigGroup;
 import org.matsim.contrib.rlev.EvModule;
 import org.matsim.contrib.rlev.charging.ChargingEventSequenceCollector;

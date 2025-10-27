@@ -4,7 +4,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import org.matsim.api.core.v01.Id;
-import org.matsim.contrib.common.timeprofile.TimeDiscretizer;
+import org.matsim.contrib.rlev.stats.util.TimeDiscretizer;
 import org.matsim.contrib.rlev.EvConfigGroup;
 import org.matsim.contrib.rlev.EvUnits;
 import org.matsim.contrib.rlev.charging.ChargingEndEvent;

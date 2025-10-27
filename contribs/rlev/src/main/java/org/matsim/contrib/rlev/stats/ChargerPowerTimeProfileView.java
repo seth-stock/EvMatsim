@@ -3,7 +3,7 @@ package org.matsim.contrib.rlev.stats;
 import com.google.common.collect.ImmutableMap;
 import org.apache.commons.lang3.tuple.Pair;
 import org.matsim.api.core.v01.Id;
-import org.matsim.contrib.common.timeprofile.ProfileWriter;
+import org.matsim.contrib.rlev.stats.util.ProfileWriter;
 
 import java.awt.*;
 import java.util.Map;

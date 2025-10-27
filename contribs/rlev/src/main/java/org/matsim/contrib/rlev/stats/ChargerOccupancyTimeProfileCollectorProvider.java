@@ -3,17 +3,17 @@
  *                                                                         *
  * *********************************************************************** *
  *                                                                         *
- * copyright       : (C) 2016 by the members listed in the COPYING,        *
- *                   LICENSE and WARRANTY file.                            *
- * email           : info at matsim dot org                                *
+ * copyright       : (C) 2016 by the members listed in the COPYING,
+ *                   LICENSE and WARRANTY file.
+ * email           : info at matsim dot org
  *                                                                         *
  * *********************************************************************** *
  *                                                                         *
- *   This program is free software; you can redistribute it and/or modify  *
- *   it under the terms of the GNU General Public License as published by  *
- *   the Free Software Foundation; either version 2 of the License, or     *
- *   (at your option) any later version.                                   *
- *   See also COPYING, LICENSE and WARRANTY file                           *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *   See also COPYING, LICENSE and WARRANTY file
  *                                                                         *
  * *********************************************************************** */
 
@@ -46,28 +46,37 @@ public final class ChargerOccupancyTimeProfileCollectorProvider implements Provi
 
 	@Override
 	public MobsimListener get() {
-		final String PLUGGED_ID = "plugged";
-		final String QUEUED_ID = "queued";
-		final String ASSIGNED_ID = "assigned";
+		ProfileCalculator calculator = new ProfileCalculator() {
+			private final ImmutableList<String> header =
+					ImmutableList.of("plugged", "queued", "assigned");
 
-		var header = ImmutableList.of(PLUGGED_ID, QUEUED_ID, ASSIGNED_ID);
-		ProfileCalculator calc = () -> {
-			int plugged = 0;
-			int queued = 0;
-			int assigned = 0;
-			for (Charger c : chargingInfrastructure.getChargers().values()) {
-				ChargingLogic logic = c.getLogic();
-				plugged += logic.getPluggedVehicles().size();
-				queued += logic.getQueuedVehicles().size();
-				if (logic instanceof ChargingWithAssignmentLogic) {
-					assigned += ((ChargingWithAssignmentLogic)logic).getAssignedVehicles().size();
-				}
+			@Override
+			public ImmutableList<String> getHeader() {
+				return header;
 			}
-			return ImmutableMap.of(PLUGGED_ID, (double)plugged, QUEUED_ID, (double)queued, ASSIGNED_ID, (double)assigned);
+
+			@Override
+			public ImmutableMap<String, Double> calcValues() {
+				int plugged = 0;
+				int queued = 0;
+				int assigned = 0;
+				for (Charger charger : chargingInfrastructure.getChargers().values()) {
+					ChargingLogic logic = charger.getLogic();
+					plugged += logic.getPluggedVehicles().size();
+					queued += logic.getQueuedVehicles().size();
+					if (logic instanceof ChargingWithAssignmentLogic assignmentLogic) {
+						assigned += assignmentLogic.getAssignedVehicles().size();
+					}
+				}
+				return ImmutableMap.of(
+						"plugged", (double) plugged,
+						"queued", (double) queued,
+						"assigned", (double) assigned);
+			}
 		};
 
-		var collector = new TimeProfileCollector(header, calc, 60, "charger_occupancy_time_profiles", matsimServices);
-		if (matsimServices.getConfig().controller().getCreateGraphsInterval()>0) {
+		var collector = new TimeProfileCollector(calculator, 60, "charger_occupancy_time_profiles", matsimServices);
+		if (matsimServices.getConfig().controler().isCreateGraphs()) {
 			collector.setChartTypes(ChartType.Line, ChartType.StackedArea);
 		} else {
 			collector.setChartTypes();

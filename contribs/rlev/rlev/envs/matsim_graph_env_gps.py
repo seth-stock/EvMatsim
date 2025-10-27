@@ -1,85 +1,95 @@
+# rlev/envs/matsim_graph_env_gps.py
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from pathlib import Path
-from typing import Dict, Any, List
-
 import torch
+from typing import Dict, Any
 
 from .matsim_graph_env import MatsimGraphEnv
 
+
 class MatsimGraphEnvGPS(MatsimGraphEnv):
     """
-    GraphGPS-friendly env: observation is a Dict with 'nodes' and 'edge_index'.
-    Uses the same action semantics as MatsimGraphEnv (one charger type per link).
+    GraphGPS-friendly env:
+      - observation is a Dict with:
+          'nodes'      : (N, F) float32   -> node features from linegraph.x
+          'edge_index' : (2, E) int64     -> COO indices of the line graph
+      - actions are identical to MatsimGraphEnv (MultiDiscrete over links)
     """
 
-    def __init__(self, config_path, num_agents=100, save_dir=None, pe_dim: int = 0):
-        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir)
+    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python"):
+        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend)
 
-        # Node features (use dataset.linegraph.x): shape (N, F)
-        node_shape = tuple(self.dataset.linegraph.x.shape)      # (N, F)
-        self._N, self._F = node_shape
+        # Shapes from the prepared dataset
+        node_feat = self.dataset.linegraph.x           # torch.Tensor (N, F)
+        edge_index = self.dataset.linegraph.edge_index # torch.LongTensor (2, E)
 
-        # Edges (fixed for the scenario). PyG expects int64 edge_index
-        self._edge_index = self.dataset.linegraph.edge_index.to(torch.int64)
-        eidx_np = self._edge_index.cpu().numpy()
-        self._E = eidx_np.shape[1]
+        # Cache sizes
+        self._N = int(node_feat.shape[0])
+        self._F = int(node_feat.shape[1])
+        self._E = int(edge_index.shape[1])
 
-        # Optional positional encodings (zero-initialized here; you can precompute later)
-        self._pe_dim = int(pe_dim)
-        self._pe = np.zeros((self._N, self._pe_dim), dtype=np.float32) if self._pe_dim > 0 else None
+        # Build observation space (MANDATORY for Gym)
+        # nodes in [0,1] because your dataset.x is normalized that way
+        self.observation_space = spaces.Dict({
+            "nodes": spaces.Box(low=0.0, high=1.0,
+                                shape=(self._N, self._F), dtype=np.float32),
+            # edge_index is fixed; we expose as int64 Box with min/max bounds
+            "edge_index": spaces.Box(low=0, high=max(self._N - 1, 1),
+                                     shape=(2, self._E), dtype=np.int64),
+        })
 
-        # Observation space as Dict: nodes + edge_index (+ pe optional)
-        spaces_dict = {
-            "nodes": spaces.Box(low=0.0, high=1.0, shape=node_shape, dtype=np.float32),
-            "edge_index": spaces.Box(low=0, high=max(eidx_np.max(), 1), shape=(2, self._E), dtype=np.int64),
-        }
-        if self._pe_dim > 0:
-            spaces_dict["pe"] = spaces.Box(low=-np.inf, high=np.inf, shape=(self._N, self._pe_dim), dtype=np.float32)
+        # action_space is already created in the base class from num_links
+        # (MultiDiscrete with length equal to number of linegraph nodes)
 
-        self.observation_space = spaces.Dict(spaces_dict)
-
-        # Action space is inherited (MultiDiscrete over links)
-        # Done flag lifecycle
+        # internal bookkeeping
         self._episode_steps = 0
+        self.done = False
+        self.reward = 0.0
 
-    # ---- helpers -----------------------------------------------------------
+        # cache edge_index numpy once (constant for the scenario)
+        self._edge_index_np = edge_index.cpu().numpy().astype(np.int64)
+
+    # ---------- helpers -----------------------------------------------------
 
     def _current_obs(self) -> Dict[str, Any]:
-        obs = {
-            "nodes": self.dataset.linegraph.x.cpu().numpy().astype(np.float32),
-            "edge_index": self._edge_index.cpu().numpy().astype(np.int64),
+        # nodes as float32 numpy
+        nodes_np = self.dataset.linegraph.x.cpu().numpy().astype(np.float32)
+        return {
+            "nodes": nodes_np,
+            "edge_index": self._edge_index_np,
         }
-        if self._pe_dim > 0:
-            obs["pe"] = self._pe
-        return obs
 
-    # ---- gym API -----------------------------------------------------------
+    # ---------- Gym API -----------------------------------------------------
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.done = False
         self.reward = 0.0
         self._episode_steps = 0
-        return self._current_obs(), {}
+        obs = self._current_obs()
+        info: Dict[str, Any] = {}
+        return obs, info
 
     def step(self, actions: np.ndarray):
         """
-        actions: shape (num_links,) with values in [0, num_charger_types-1]
+        actions: shape (num_links,) with integer choices in [0, num_charger_types-1]
         """
-        # clamp/sanitize
-        actions = np.asarray(actions, dtype=np.int64).clip(0, self.num_charger_types - 1)
+        # Sanitize
+        actions = np.asarray(actions, dtype=np.int64)
+        if actions.ndim != 1:
+            actions = actions.reshape(-1)
+        actions = np.clip(actions, 0, self.num_charger_types - 1)
 
-        # compute reward via server
-        reward = self.send_reward_request(actions)
+        # Compute reward via the server round-trip
+        r = self.send_reward_request(actions)
 
-        self.reward = float(reward)
+        self.reward = float(r)
         self._episode_steps += 1
 
-        # Single-step episodes (like your  n_steps default of 1)
+        # One-step episodes (PPO will collect n_steps rollouts anyway)
         terminated = False
         truncated = False
-        info = {"graph_env_inst": self}
 
+        info = {"graph_env_inst": self}
         return self._current_obs(), self.reward, terminated, truncated, info

@@ -15,8 +15,8 @@ import org.matsim.contrib.rlev.fleet.ElectricFleet;
 import org.matsim.contrib.rlev.fleet.ElectricFleetSpecification;
 import org.matsim.contrib.rlev.infrastructure.ChargingInfrastructureSpecification;
 import org.matsim.core.config.Config;
-import org.matsim.core.config.groups.RoutingConfigGroup;
-import org.matsim.core.config.groups.RoutingConfigGroup.AccessEgressType;
+import org.matsim.core.config.groups.PlansCalcRouteConfigGroup;
+import org.matsim.core.config.groups.PlansCalcRouteConfigGroup.AccessEgressType;
 import org.matsim.core.network.NetworkUtils;
 import org.matsim.core.network.algorithms.TransportModeNetworkFilter;
 import org.matsim.core.router.DefaultRoutingModules;
@@ -48,7 +48,7 @@ public class EvNetworkRoutingProvider implements Provider<RoutingModule> {
 	private Config config;
 
 	@Inject
-	private RoutingConfigGroup routingConfigGroup;
+	private PlansCalcRouteConfigGroup routingConfigGroup;
 
 	@Inject
 	private Network network;
