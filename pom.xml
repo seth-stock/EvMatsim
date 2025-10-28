@@ -16,7 +16,7 @@
 
     <!-- Centralize versions used by modules -->
     <matsim.version>2025.0-SNAPSHOT</matsim.version>
-    <guava.version>33.3.0-jre</guava.version>
+    <guava.version>33.5.0-jre</guava.version>
     <jai.imageio.version>1.4.0</jai.imageio.version>
     <twelvemonkeys.version>3.12.0</twelvemonkeys.version>
   </properties>
