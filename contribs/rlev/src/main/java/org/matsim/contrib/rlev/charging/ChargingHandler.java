@@ -33,19 +33,33 @@ public class ChargingHandler implements MobsimAfterSimStepListener {
 	private static final Logger log = LogManager.getLogger( ChargingHandler.class );
 	private final Iterable<Charger> chargers;
 	private final int chargeTimeStep;
+	private double lastChargeUpdateTime;
 
 	@Inject
 	ChargingHandler(ChargingInfrastructure chargingInfrastructure, EvConfigGroup evConfig) {
 		this.chargers = chargingInfrastructure.getChargers().values();
-		this.chargeTimeStep = evConfig.chargeTimeStep;
+		this.chargeTimeStep = Math.max(1, evConfig.chargeTimeStep);
+		this.lastChargeUpdateTime = 0.0;
 	}
 
 	@Override
 	public void notifyMobsimAfterSimStep(@SuppressWarnings("rawtypes") MobsimAfterSimStepEvent e) {
-		if ((e.getSimulationTime() + 1) % chargeTimeStep == 0) {
+		if (chargeTimeStep <= 0) {
+			return;
+		}
+		double simTime = e.getSimulationTime();
+		if (simTime <= lastChargeUpdateTime) {
+			return;
+		}
+		if (simTime - lastChargeUpdateTime + 1e-9 < chargeTimeStep) {
+			return;
+		}
+
+		while (simTime - lastChargeUpdateTime + 1e-9 >= chargeTimeStep) {
 			for (Charger c : chargers) {
-				c.getLogic().chargeVehicles(chargeTimeStep, e.getSimulationTime());
+				c.getLogic().chargeVehicles(chargeTimeStep, simTime);
 			}
+			lastChargeUpdateTime += chargeTimeStep;
 		}
 	}
 }

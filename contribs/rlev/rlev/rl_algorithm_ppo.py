@@ -8,6 +8,10 @@ Non-optional Fix C:
 
 import argparse
 import os
+import json
+import random
+import hashlib
+import platform
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -56,6 +60,8 @@ except Exception as _e:
 from stable_baselines3.common.buffers import RolloutBuffer as _RB
 import inspect as _inspect
 
+from rlev.java_jvm import ensure_uber_jar
+
 if not getattr(_RB, "_rlev_patched", False):
     _RB__add_orig = _RB.add
 
@@ -86,8 +92,52 @@ def _print_cuda_diag():
             device_name=(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
         )
         print(f"[CUDA DIAG] {info}", flush=True)
+        return info
     except Exception as e:
         print(f"[CUDA DIAG] error: {e}", flush=True)
+        return {"error": str(e)}
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _write_manifest(save_dir: Path, args: argparse.Namespace, cuda_info: dict[str, Any]) -> None:
+    def _to_jsonable(value):
+        if isinstance(value, dict):
+            return {k: _to_jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_to_jsonable(v) for v in value]
+        if isinstance(value, Path):
+            return str(value)
+        return value
+
+    manifest = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "cli_args": _to_jsonable(vars(args)),
+        "seed": args.seed,
+        "cuda": _to_jsonable(cuda_info),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "run_directory": str(save_dir),
+        "manifest_version": 1,
+    }
+    try:
+        jar_path = ensure_uber_jar()
+        jar_bytes = Path(jar_path).read_bytes()
+        manifest["uber_jar"] = {
+            "path": str(jar_path),
+            "sha256": hashlib.sha256(jar_bytes).hexdigest(),
+        }
+    except Exception as exc:
+        manifest["uber_jar"] = {"error": str(exc)}
+
+    with open(save_dir / "manifest.json", "w", encoding="utf-8") as fp:
+        json.dump(manifest, fp, indent=2)
 
 
 class TensorboardCallback(BaseCallback):
@@ -108,6 +158,10 @@ class TensorboardCallback(BaseCallback):
         avg_cost = 0.0
         avg_charger_eff = 0.0
         avg_time_eff = 0.0
+        avg_queue = 0.0
+        avg_charge_duration = 0.0
+        avg_energy = 0.0
+        avg_completed = 0.0
 
         for infos in infos_list:
             env_inst = infos.get("graph_env_inst")
@@ -119,6 +173,10 @@ class TensorboardCallback(BaseCallback):
             avg_cost += float(getattr(env_inst, "_charger_cost", 0.0))
             avg_charger_eff += float(getattr(env_inst, "_charger_efficiency", 0.0))
             avg_time_eff += float(getattr(env_inst, "_time_efficiency", 0.0))
+            avg_queue += float(getattr(env_inst, "_avg_queue_time_sec", 0.0))
+            avg_charge_duration += float(getattr(env_inst, "_avg_charge_duration_sec", 0.0))
+            avg_energy += float(getattr(env_inst, "_energy_kwh", 0.0))
+            avg_completed += float(getattr(env_inst, "_completed_charges", 0.0))
 
             if reward > self.best_reward:
                 self.best_reward = reward
@@ -134,6 +192,10 @@ class TensorboardCallback(BaseCallback):
         self.logger.record("metrics/avg_charger_cost", avg_cost / n)
         self.logger.record("metrics/avg_charger_efficiency", avg_charger_eff / n)
         self.logger.record("metrics/avg_time_efficiency", avg_time_eff / n)
+        self.logger.record("metrics/avg_queue_time_sec", avg_queue / n)
+        self.logger.record("metrics/avg_charge_duration_sec", avg_charge_duration / n)
+        self.logger.record("metrics/avg_energy_kwh", avg_energy / n)
+        self.logger.record("metrics/avg_completed_charges", avg_completed / n)
         return True
 
 
@@ -143,42 +205,49 @@ def main(args: argparse.Namespace):
     print(f"[ENV] RLEV_BACKEND={os.environ['RLEV_BACKEND']}", flush=True)
 
     # ---------- Output dir ----------
-    save_dir = f"{args.results_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}/"
-    os.makedirs(save_dir, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    save_dir = Path(args.results_dir) / run_id
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(Path(save_dir, "args.txt"), "w") as f:
+    with open(save_dir / "args.txt", "w", encoding="utf-8") as f:
         for k, v in vars(args).items():
             f.write(f"{k}:{v}\n")
 
+    cuda_info = _print_cuda_diag()
+    _write_manifest(save_dir, args, cuda_info)
+
     # ---------- Env factory ----------
-    def make_env():
-        make_kwargs = dict(
-            config_path=args.matsim_config,
-            num_agents=args.num_agents,
-            save_dir=save_dir,
-            backend=args.backend,           # <<< force the backend into the env
-        )
-        if args.policy_type == "MlpPolicy":
-            return gym.make("MatsimGraphEnvMlp-v0", **make_kwargs)
-        elif args.policy_type == "GNNPolicy":
-            return gym.make("MatsimGraphEnvGNN-v0", **make_kwargs)
-        elif args.policy_type == "GraphGPS":
-            return gym.make("MatsimGraphEnvGPS-v0", **make_kwargs)
-        else:
-            raise ValueError(f"Unknown policy_type: {args.policy_type}")
+    def make_env(rank: int):
+        def _init():
+            make_kwargs = dict(
+                config_path=args.matsim_config,
+                num_agents=args.num_agents,
+                save_dir=save_dir,
+                backend=args.backend,
+                fast_opts=args.fast_opts,
+                seed=(args.seed + rank) if args.seed is not None else None,
+            )
+            if args.policy_type == "MlpPolicy":
+                return gym.make("MatsimGraphEnvMlp-v0", **make_kwargs)
+            elif args.policy_type == "GNNPolicy":
+                return gym.make("MatsimGraphEnvGNN-v0", **make_kwargs)
+            elif args.policy_type == "GraphGPS":
+                return gym.make("MatsimGraphEnvGPS-v0", **make_kwargs)
+            else:
+                raise ValueError(f"Unknown policy_type: {args.policy_type}")
+        return _init
 
     # Windows-friendly (no subprocess fork)
-    env = DummyVecEnv([make_env for _ in range(args.num_envs)])
+    env = DummyVecEnv([make_env(i) for i in range(args.num_envs)])
 
     # Save frequency is per-env; scale to total steps
     args.save_frequency //= max(1, args.num_envs)
 
     tensorboard_cb = TensorboardCallback(save_dir=save_dir)
-    checkpoint_cb = CheckpointCallback(save_freq=args.save_frequency, save_path=save_dir)
+    checkpoint_cb = CheckpointCallback(save_freq=args.save_frequency, save_path=str(save_dir))
     callback = CallbackList([tensorboard_cb, checkpoint_cb])
 
     # ---------- Device ----------
-    _print_cuda_diag()
     if args.device == "cuda":
         device_str = "cuda:0"
     elif args.device == "cpu":
@@ -218,7 +287,7 @@ def main(args: argparse.Namespace):
             n_steps=args.num_steps,
             verbose=1,
             device=device_str,
-            tensorboard_log=save_dir,
+            tensorboard_log=str(save_dir),
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             policy_kwargs=policy_kwargs,
@@ -230,7 +299,7 @@ def main(args: argparse.Namespace):
             n_steps=args.num_steps,
             verbose=1,
             device=device_str,
-            tensorboard_log=save_dir,
+            tensorboard_log=str(save_dir),
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             clip_range=args.clip_range,
@@ -272,6 +341,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
                         help="Device override. 'auto' chooses cuda if available else cpu.")
 
+    parser.add_argument("--seed", type=int, default=42, help="Global RNG seed propagated to PyTorch, Gym, and MATSim.")
     parser.add_argument("--num_timesteps", type=int, default=1_000_000,
                         help="Total timesteps: n_steps * num_envs * iterations.")
     parser.add_argument("--num_envs", type=int, default=100, help="Number of parallel envs.")
@@ -302,7 +372,8 @@ if __name__ == "__main__":
         choices=["python", "server", "jvm"],
         help="Where to run MATSim from the env: 'python' (local JPype), 'jvm' (local via CLI JPype), or 'server' (HTTP).",
     )
-
+    parser.add_argument("--fast_opts", action="store_true",
+                    help="Pass fastOpts=True into the MatsimGraphEnv (JPype runner).")
     # GraphGPS knobs
     parser.add_argument("--gps_dim", type=int, default=128, help="GraphGPS features_dim.")
     parser.add_argument("--gps_layers", type=int, default=3, help="GraphGPS number of layers.")
@@ -314,4 +385,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args.mlp_dims = [int(x) for x in str(args.mlp_dims).split()]
+    _seed_everything(args.seed)
     main(args)

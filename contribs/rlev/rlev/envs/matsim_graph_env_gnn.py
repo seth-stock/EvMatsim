@@ -10,7 +10,7 @@ class MatsimGraphEnvGNN(MatsimGraphEnv):
     with GNNs. It supports multi-agent actions and observations.
     """
 
-    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python"):
+    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python", fast_opts: bool = False, seed: int | None = None):
         """
         Initialize the environment.
 
@@ -19,19 +19,20 @@ class MatsimGraphEnvGNN(MatsimGraphEnv):
             num_agents (int): Number of agents in the environment.
             save_dir (str): Directory to save outputs.
         """
-        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend)
+        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend, fast_opts=fast_opts, seed=seed)
 
         self.observation_space: spaces.Dict = spaces.Dict(
             spaces=dict(x=self.x, edge_index=self.edge_index_space)
         )
 
-    def reset(self, **kwargs):
+    def reset(self, *, seed=None, options=None):
         """
         Reset the environment to its initial state.
 
         Returns:
             tuple: Initial observation and additional info.
         """
+        self._maybe_update_seed(seed)
         return dict(
             x=self.dataset.linegraph.x.numpy(),
             edge_index=self.dataset.linegraph.edge_index.numpy().astype(np.int32),

@@ -99,11 +99,12 @@ public class OCPRewardServer {
                 // >>> FIX: declare probe OUTSIDE try so we can read from it afterwards.
                 RewardProbe probe = new RewardProbe();
 
+                Config runCfg = null;
                 try (PrintWriter log = new PrintWriter(new FileWriter(logFile, true))) {
                     log.println("=== Starting MATSim Controler.run() ===");
                     log.flush();
 
-                    Config runCfg = ConfigUtils.loadConfig(configPath.toString());
+                    runCfg = ConfigUtils.loadConfig(configPath.toString());
 
                     // --- SPEEDUPS: keep I/O & work minimal for server-side runs ---
                     runCfg.controler().setLastIteration(0);
@@ -142,7 +143,22 @@ public class OCPRewardServer {
 
                 // >>> FIX: use probe-only rewards (no file parsing fallback — fastest path)
                 double timeReward = probe.getAvgLegDurationSec() / 86400.0;
-                double chargeReward = probe.getChargeIntegralProxy();
+
+                double avgCapacityKWh = 1.0;
+                if (runCfg != null && runCfg.vehicles() != null) {
+                    String vehiclesFile = runCfg.vehicles().getVehiclesFile();
+                    if (vehiclesFile != null && !vehiclesFile.isEmpty()) {
+                        Path vehiclesPath = configPath.getParent().resolve(vehiclesFile);
+                        double capacity = getAverageEnergyCapacity(vehiclesPath.toString());
+                        if (capacity > 0) {
+                            avgCapacityKWh = capacity;
+                        }
+                    }
+                }
+                double energyKWh = probe.getEnergyChargedKWh();
+                long completedCharges = Math.max(1L, probe.getCompletedCharges());
+                double denom = Math.max(1.0, avgCapacityKWh * completedCharges);
+                double chargeReward = energyKWh / denom;
 
                 Path outDir = configPath.getParent().resolve("output");
 

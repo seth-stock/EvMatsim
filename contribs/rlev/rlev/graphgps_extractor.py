@@ -46,16 +46,20 @@ class LocalGlobalBlock(nn.Module):
         # Local message passing (always eval in fp32 to avoid half precision NaNs)
         local_in = x_norm.to(torch.float32)
         h = self.local(local_in, edge_index).to(dtype)  # (B*K, D)
+        h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
         x = x_norm + self.drop(h)                       # residual after local
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # Global attention: compute scores in fp32 to avoid softmax overflow
-        tokens = x.view(B, K, -1)
+        tokens = torch.nan_to_num(x.view(B, K, -1), nan=0.0, posinf=1e4, neginf=-1e4)
         attn_in = tokens.to(torch.float32)
         attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=1e4, neginf=-1e4)
         y = attn_out.to(dtype).reshape(B * K, -1)
 
         # Second residual + LayerNorm (again keep fp32 inside the norm)
         x = x + self.drop(y)
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
         x = self.norm2(x.to(torch.float32)).to(dtype)
 
         # Clamp any remaining NaNs/Infs that could arise from fp16 overflows
@@ -88,6 +92,7 @@ class GraphGPSExtractor(BaseFeaturesExtractor):
         self.use_amp = bool(use_amp)
         self._want_cudagraphs = bool(use_cudagraphs)
         self._amp_warned = False
+        self._amp_train_warned = False
 
         in_dim = int(observation_space["nodes"].shape[-1])  # type: ignore[attr-defined]
         self.in_proj = nn.Identity() if in_dim == self.embed_dim else nn.Linear(in_dim, self.embed_dim)
@@ -112,6 +117,17 @@ class GraphGPSExtractor(BaseFeaturesExtractor):
         self._B: Optional[int] = None
         self._F: Optional[int] = None
 
+    def _should_use_amp(self, device: torch.device) -> bool:
+        """
+        Only enable autocast on CUDA when gradients are disabled (i.e., rollout/inference).
+        During training (grad enabled) we stay in fp32 to avoid NaNs without a GradScaler.
+        """
+        return (
+            self.use_amp
+            and device.type == "cuda"
+            and not torch.is_grad_enabled()
+        )
+
     # ---------- fixed templates ----------
     def _ensure_templates(self, obs: Dict[str, Any], device: torch.device):
         x = _to_device(obs["nodes"], device)       # (B,N,F) or (N,F)
@@ -135,13 +151,30 @@ class GraphGPSExtractor(BaseFeaturesExtractor):
         self._batched_ei = ei_b.reshape(2, B * E_sel).contiguous()      # (2, B*E_sel)
         self._batch_vec = torch.repeat_interleave(torch.arange(B, device=device), K)  # (B*K,)
 
-        # static buffers (AMP-aware dtype)
-        dtype_nodes = torch.float16 if (device.type == "cuda" and self.use_amp) else torch.float32
-        self._static_nodes = torch.empty((B, K, F), dtype=dtype_nodes, device=device)
-        self._static_out = torch.empty((B, self.embed_dim), dtype=torch.float32, device=device)
+        amp_active = self._should_use_amp(device)
+        dtype_nodes = torch.float16 if amp_active else torch.float32
+
+        needs_nodes = (
+            self._static_nodes is None
+            or self._static_nodes.shape != (B, K, F)
+            or self._static_nodes.dtype != dtype_nodes
+            or self._static_nodes.device != device
+        )
+        if needs_nodes:
+            self._static_nodes = torch.empty((B, K, F), dtype=dtype_nodes, device=device)
+            self._captured = False  # dtype/device change invalidates captured graphs
+
+        needs_out = (
+            self._static_out is None
+            or self._static_out.shape != (B, self.embed_dim)
+            or self._static_out.device != device
+        )
+        if needs_out:
+            self._static_out = torch.empty((B, self.embed_dim), dtype=torch.float32, device=device)
+            self._captured = False
 
         self._B, self._F = B, F
-        self._captured = False
+        self._amp_active_cache = amp_active
 
     def _assemble_data_from_static(self) -> Data:
         x_flat = self._static_nodes.view(self._B * self._sel_idx.numel(), self._F)  # type: ignore[arg-type]
@@ -149,10 +182,13 @@ class GraphGPSExtractor(BaseFeaturesExtractor):
 
     # ---------- forward (no capture) ----------
     def _stack_forward(self, data: Data, *, check_amp: bool = True) -> torch.Tensor:
-        amp_enabled = self.use_amp and data.x.is_cuda
+        amp_enabled = self._should_use_amp(data.x.device)
+        if self.use_amp and not amp_enabled and torch.is_grad_enabled() and not self._amp_train_warned:
+            print("[GraphGPSExtractor] AMP is only used during rollout; training runs in fp32 for stability.", flush=True)
+            self._amp_train_warned = True
 
         def _forward_once():
-            x = self.in_proj(data.x)  # (B*K, D)
+            x = self.in_proj(data.x.to(self.in_proj.weight.dtype))  # (B*K, D)
             B = self._B
             K = self._sel_idx.numel()
 

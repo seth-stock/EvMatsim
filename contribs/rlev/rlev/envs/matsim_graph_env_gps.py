@@ -17,8 +17,8 @@ class MatsimGraphEnvGPS(MatsimGraphEnv):
       - actions are identical to MatsimGraphEnv (MultiDiscrete over links)
     """
 
-    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python"):
-        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend)
+    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python", fast_opts: bool = False, seed: int | None = None):
+        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend, fast_opts=fast_opts, seed=seed)
 
         # Shapes from the prepared dataset
         node_feat = self.dataset.linegraph.x           # torch.Tensor (N, F)
@@ -63,7 +63,7 @@ class MatsimGraphEnvGPS(MatsimGraphEnv):
     # ---------- Gym API -----------------------------------------------------
 
     def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed)
+        self._maybe_update_seed(seed)
         self.done = False
         self.reward = 0.0
         self._episode_steps = 0

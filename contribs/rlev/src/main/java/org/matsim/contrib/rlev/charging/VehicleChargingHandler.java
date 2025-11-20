@@ -26,6 +26,8 @@ package org.matsim.contrib.rlev.charging;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.inject.Inject;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.matsim.api.core.v01.Id;
 import org.matsim.api.core.v01.events.ActivityEndEvent;
 import org.matsim.api.core.v01.events.ActivityStartEvent;
@@ -42,6 +44,7 @@ import org.matsim.api.core.v01.population.Activity;
 import org.matsim.api.core.v01.population.Person;
 import org.matsim.api.core.v01.population.PlanElement;
 import org.matsim.contrib.rlev.EvConfigGroup;
+import org.matsim.contrib.rlev.RewardProbe;
 import org.matsim.contrib.rlev.fleet.ElectricFleet;
 import org.matsim.contrib.rlev.fleet.ElectricVehicle;
 import org.matsim.contrib.rlev.infrastructure.Charger;
@@ -62,6 +65,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 /**
  * This is an events based approach to trigger vehicle charging. Vehicles will be charged as soon as a person begins a charging activity.
@@ -73,6 +77,8 @@ public class VehicleChargingHandler
 		implements ActivityStartEventHandler, ActivityEndEventHandler, PersonLeavesVehicleEventHandler, QueuedAtChargerEventHandler, ChargingStartEventHandler,
 		ChargingEndEventHandler, QuitQueueAtChargerEventHandler,
 	MobsimBeforeSimStepListener, MobsimScopeEventHandler, LinkEnterEventHandler, LinkLeaveEventHandler {
+
+	private static final Logger LOG = LogManager.getLogger(VehicleChargingHandler.class);
 
 	public static final String CHARGING_IDENTIFIER = " charging";
 	public static final String CHARGING_INTERACTION = PlanCalcScoreConfigGroup.createStageActivityType(
@@ -91,9 +97,12 @@ public class VehicleChargingHandler
 	private final ImmutableListMultimap<Id<Link>, Charger> chargersAtLinks;
 	private final EvConfigGroup evCfg;
 	private final ImmutableListMultimap<Id<Link>, Charger> dynamicChargers;
+	@Nullable
+	private final RewardProbe rewardProbe;
 
 	@Inject
-	VehicleChargingHandler(ChargingInfrastructure chargingInfrastructure, ElectricFleet electricFleet, EvConfigGroup evConfigGroup) {
+	VehicleChargingHandler(ChargingInfrastructure chargingInfrastructure, ElectricFleet electricFleet, EvConfigGroup evConfigGroup,
+			@Nullable RewardProbe rewardProbe) {
 		this.chargingInfrastructure = chargingInfrastructure;
 		this.electricFleet = electricFleet;
 		this.evCfg = evConfigGroup;
@@ -106,6 +115,7 @@ public class VehicleChargingHandler
 				Map.Entry::getKey,
 				Map.Entry::getValue
 			));
+		this.rewardProbe = rewardProbe;
 	}
 
 	/**
@@ -126,8 +136,9 @@ public class VehicleChargingHandler
 							.filter(ch -> ev.getChargerTypes().contains(ch.getChargerType()))
 							.findAny()
 							.get();
-					c.getLogic().addVehicle(ev, event.getTime());
-					vehiclesAtChargers.put(evId, c.getId());
+					if (registerVehicle(ev, c, event.getTime())) {
+						addVehicleWithTelemetry(c, ev, event.getTime());
+					}
 				}
 			}
 		}
@@ -230,6 +241,37 @@ public class VehicleChargingHandler
 		}
 	}
 
+	private void addVehicleWithTelemetry(Charger charger, ElectricVehicle ev, double now) {
+		if (rewardProbe != null) {
+			charger.getLogic().addVehicle(ev, rewardProbe, now);
+		} else {
+			charger.getLogic().addVehicle(ev, now);
+		}
+	}
+
+	private boolean registerVehicle(ElectricVehicle ev, Charger charger, double time) {
+		Id<Vehicle> evId = ev.getId();
+		Id<Charger> existing = vehiclesAtChargers.get(evId);
+		if (existing != null) {
+			if (existing.equals(charger.getId())) {
+				if (LOG.isDebugEnabled()) {
+					LOG.debug("Vehicle {} already registered at charger {} at t={}. Reusing association.", evId, charger.getId(),
+							time);
+				}
+				return true;
+			}
+			LOG.warn("Vehicle {} re-registering from charger {} to {} at t={}. Forcing reassignment.", evId, existing, charger.getId(),
+					time);
+			Charger previous = chargingInfrastructure.getChargers().get(existing);
+			if (previous != null) {
+				previous.getLogic().removeVehicle(ev, time);
+			}
+			vehiclesAtChargers.remove(evId);
+		}
+		vehiclesAtChargers.put(evId, charger.getId());
+		return true;
+	}
+
 	private void removeLastDriver(Id<Vehicle> vehicleId) {
 		if (lastDriver.get(vehicleId) != null) {
 			agentsInChargerQueue.remove(lastDriver.get(vehicleId));
@@ -254,8 +296,9 @@ public class VehicleChargingHandler
 							.filter(ch -> ev.getChargerTypes().contains(ch.getChargerType()))
 							.findAny()
 							.get();
-					c.getLogic().addVehicle(ev, event.getTime());
-					vehiclesAtChargers.put(evId, c.getId());
+					if (registerVehicle(ev, c, event.getTime())) {
+						addVehicleWithTelemetry(c, ev, event.getTime());
+					}
 				}
 			}
 		}

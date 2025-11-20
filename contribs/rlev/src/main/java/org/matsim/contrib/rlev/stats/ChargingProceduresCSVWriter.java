@@ -23,11 +23,18 @@ package org.matsim.contrib.rlev.stats;
 import com.google.inject.Inject;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVPrinter;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.matsim.api.core.v01.Id;
 import org.matsim.api.core.v01.network.Link;
 import org.matsim.contrib.rlev.EvUnits;
+import org.matsim.contrib.rlev.charging.ChargingEndEvent;
 import org.matsim.contrib.rlev.charging.ChargingEventSequenceCollector;
+import org.matsim.contrib.rlev.charging.ChargingStartEvent;
+import org.matsim.contrib.rlev.charging.QueuedAtChargerEvent;
+import org.matsim.contrib.rlev.charging.QuitQueueAtChargerEvent;
 import org.matsim.contrib.rlev.infrastructure.Charger;
+import org.matsim.contrib.rlev.infrastructure.ChargerSpecification;
 import org.matsim.contrib.rlev.infrastructure.ChargingInfrastructureSpecification;
 import org.matsim.core.controler.events.IterationEndsEvent;
 import org.matsim.core.controler.listener.IterationEndsListener;
@@ -38,8 +45,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Collection;
+import java.util.Optional;
 
 public final class ChargingProceduresCSVWriter implements IterationEndsListener {
+
+	private static final Logger log = LogManager.getLogger(ChargingProceduresCSVWriter.class);
 
 	@Inject
 	ChargingEventSequenceCollector chargingEventSequenceCollector;
@@ -70,47 +80,68 @@ public final class ChargingProceduresCSVWriter implements IterationEndsListener 
 
 	private void proccessChargingEventSequences(CSVPrinter csvPrinter, Collection<ChargingEventSequenceCollector.ChargingSequence> chargingSequences) throws IOException {
 		for (ChargingEventSequenceCollector.ChargingSequence sequence : chargingSequences) {
-			Id<Charger> chargerId = sequence.getQueuedAtCharger().isPresent() ?
-				sequence.getQueuedAtCharger().get().getChargerId() : sequence.getChargingStart().get().getChargerId();
+			Optional<QueuedAtChargerEvent> queuedAtCharger = sequence.getQueuedAtCharger();
+			Optional<ChargingStartEvent> chargingStart = sequence.getChargingStart();
+			Optional<ChargingEndEvent> chargingEnd = sequence.getChargingEnd();
+			Optional<QuitQueueAtChargerEvent> quitQueue = sequence.getQuitQueueAtChargerEvent();
 
-			Id<Link> linkId = chargingInfrastructureSpecification.getChargerSpecifications().get(chargerId).getLinkId();
-
-			Id<Vehicle> vehicleId = sequence.getQueuedAtCharger().isPresent() ?
-				sequence.getQueuedAtCharger().get().getVehicleId() : sequence.getChargingStart().get().getVehicleId();
-
+			Id<Charger> chargerId;
+			Id<Vehicle> vehicleId;
 			double waitStartTime = Double.NaN;
-			double waitEndTime = Double.NaN;
-			//TODO : Something in the condition below causes a no value present error
-			if (sequence.getQuitQueueAtChargerEvent().isPresent()) {
-				waitEndTime = sequence.getQuitQueueAtChargerEvent().get().getTime();
-			} else if (sequence.getChargingStart().isPresent()) {
-				waitEndTime = sequence.getChargingStart().get().getTime();
+			if (queuedAtCharger.isPresent()) {
+				chargerId = queuedAtCharger.get().getChargerId();
+				vehicleId = queuedAtCharger.get().getVehicleId();
+				waitStartTime = queuedAtCharger.get().getTime();
+			} else if (chargingStart.isPresent()) {
+				chargerId = chargingStart.get().getChargerId();
+				vehicleId = chargingStart.get().getVehicleId();
 			} else {
-				// Handle the case where both events are absent
-				// For example, log a warning or set a default value
-				waitEndTime = Double.NaN;
-				System.err.println("Warning: No quit queue or charging start event found for sequence " + sequence);
+				log.warn("Skipping charging sequence without queue or start event: {}", sequence);
+				continue;
+			}
+
+			ChargerSpecification chargerSpecification = chargingInfrastructureSpecification.getChargerSpecifications().get(chargerId);
+			if (chargerSpecification == null) {
+				log.warn("No charger specification found for id {}. Skipping sequence {}", chargerId, sequence);
+				continue;
+			}
+			Id<Link> linkId = chargerSpecification.getLinkId();
+
+			double waitEndTime = Double.NaN;
+			if (quitQueue.isPresent()) {
+				waitEndTime = quitQueue.get().getTime();
+			} else if (chargingStart.isPresent()) {
+				waitEndTime = chargingStart.get().getTime();
+			} else {
+				log.debug("No quit queue or charging start event found for sequence {}", sequence);
 			}
 
 			double startEnergy = Double.NaN;
 			double startTime = Double.NaN;
-			if (sequence.getChargingStart().isPresent()) {
-				startEnergy = sequence.getChargingStart().get().getCharge();
-				startTime = sequence.getChargingStart().get().getTime();
+			if (chargingStart.isPresent()) {
+				startEnergy = chargingStart.get().getCharge();
+				startTime = chargingStart.get().getTime();
 			}
+
 			double endEnergy = Double.NaN;
 			double endTime = Double.NaN;
-			if (sequence.getChargingEnd().isPresent()) {
-				endEnergy = sequence.getChargingEnd().get().getCharge();
-				endTime = sequence.getChargingEnd().get().getTime();
+			if (chargingEnd.isPresent()) {
+				endEnergy = chargingEnd.get().getCharge();
+				endTime = chargingEnd.get().getTime();
 			}
-			double energyTransmitted = endEnergy - startEnergy;
 
-			double energyKWh = Math.round(EvUnits.J_to_kWh(energyTransmitted) * 10.) / 10.;
+			double energyKWh = Double.NaN;
+			if (!Double.isNaN(startEnergy) && !Double.isNaN(endEnergy)) {
+				double energyTransmitted = endEnergy - startEnergy;
+				energyKWh = Math.round(EvUnits.J_to_kWh(energyTransmitted) * 10.) / 10.;
+			}
+
+			double waitDuration = (!Double.isNaN(waitStartTime) && !Double.isNaN(waitEndTime)) ? waitEndTime - waitStartTime : Double.NaN;
+			double chargeDuration = (!Double.isNaN(startTime) && !Double.isNaN(endTime)) ? endTime - startTime : Double.NaN;
 
 			csvPrinter.printRecord(chargerId, vehicleId, linkId,
-				Time.writeTime(waitStartTime), Time.writeTime(waitEndTime), Time.writeTime(waitEndTime - waitStartTime),
-				Time.writeTime(startTime), Time.writeTime(endTime), Time.writeTime(endTime - startTime),
+				Time.writeTime(waitStartTime), Time.writeTime(waitEndTime), Time.writeTime(waitDuration),
+				Time.writeTime(startTime), Time.writeTime(endTime), Time.writeTime(chargeDuration),
 				energyKWh);
 		}
 	}

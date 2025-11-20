@@ -23,12 +23,7 @@
   </module>
 
   <!-- Counts (dummy is OK, just needed by the loader) -->
-  <module name="counts">
-    <param name="inputCountsFile" value="C:/EvMatsim/wasfrontscenario/counts.xml"/>
-    <param name="writeCountsInterval" value="0"/>
-    <param name="averageCountsOverIterations" value="1"/>
-    <param name="countsScaleFactor" value="1"/>
-  </module>
+  
 
   <!-- Controller -->
   <module name="controler">
@@ -49,11 +44,11 @@
   </module>
 
   <module name="parallelEventHandling">
-  <param name="oneThreadPerHandler" value="true"/>
+  <param name="oneThreadPerHandler" value="false"/>
   <param name="numberOfThreads" value="12"/>
   <param name="synchronizeOnSimSteps" value="false"/>
   <param name="estimatedNumberOfEvents" value="0"/>
-  <param name="eventsQueueSize" value="1000000"/>
+  <param name="eventsQueueSize" value="100000"/>
   </module>
 
 
@@ -164,3 +159,4 @@
   </module>
 
 </config>
+

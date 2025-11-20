@@ -22,6 +22,7 @@ package org.matsim.contrib.rlev.charging;
 
 import com.google.inject.Singleton;
 import org.matsim.contrib.rlev.EvModule;
+import org.matsim.contrib.rlev.RewardProbe;
 import org.matsim.core.api.experimental.events.EventsManager;
 import org.matsim.core.controler.AbstractModule;
 import org.matsim.core.mobsim.qsim.AbstractQSimModule;
@@ -48,8 +49,10 @@ public class ChargingModule extends AbstractModule {
 
 		bind(ChargingLogic.Factory.class).toProvider(new Provider<>() {
 			@Inject private EventsManager eventsManager;
+			@Inject(optional = true)
+			private RewardProbe rewardProbe;
 			@Override public ChargingLogic.Factory get() {
-				return charger -> new DynamicAndQueingChargingLogic(charger, new ChargeUpToMaxSocStrategy(charger, 1.), eventsManager);
+				return charger -> new DynamicAndQueingChargingLogic(charger, new ChargeUpToMaxSocStrategy(charger, 1.), eventsManager, rewardProbe);
 			}
 		});
 

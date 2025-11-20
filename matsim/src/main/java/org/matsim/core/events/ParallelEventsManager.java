@@ -107,10 +107,12 @@ public final class ParallelEventsManager implements EventsManager {
 			}
 		}
 
+		int queueCapacityPerHandler = Math.max(1, this.eventsQueueSize / Math.max(1, this.eventsManagers.size()));
+
 		// initialize runnables (threads that will execute the event managers)
 		for (int i = 0; i < this.eventsManagers.size(); i++) {
 			EventsManager eventsManager = this.eventsManagers.get(i);
-			ProcessEventsRunnable processEventsRunnable = new ProcessEventsRunnable(eventsManager, distributor);
+			ProcessEventsRunnable processEventsRunnable = new ProcessEventsRunnable(eventsManager, distributor, queueCapacityPerHandler);
 			distributor.runnables.add(processEventsRunnable);
 			processEventsRunnable.setDaemon(true);
 			processEventsRunnable.setUncaughtExceptionHandler(this.uncaughtExceptionHandler);
@@ -270,9 +272,9 @@ public final class ParallelEventsManager implements EventsManager {
 			}
 		}
 
-		private void distribute(EventArray events) {
+		private void distribute(EventArray events) throws InterruptedException {
 			for (ProcessEventsRunnable runnable : this.runnables) {
-				runnable.eventsQueue.add(events);
+				runnable.enqueue(events);
 			}
 		}
 
@@ -353,10 +355,14 @@ public final class ParallelEventsManager implements EventsManager {
 		private final BlockingQueue<EventArray> eventsQueue;
 		private boolean flush = false;
 
-		public ProcessEventsRunnable(EventsManager eventsManager, Distributor distributor) {
+		public ProcessEventsRunnable(EventsManager eventsManager, Distributor distributor, int queueCapacity) {
 			this.eventsManager = eventsManager;
-			this.eventsQueue = new LinkedBlockingQueue<>();
+			this.eventsQueue = new ArrayBlockingQueue<>(queueCapacity);
 			this.distributor = distributor;
+		}
+
+		void enqueue(EventArray events) throws InterruptedException {
+			this.eventsQueue.put(events);
 		}
 
 		public synchronized void flush() {

@@ -3,23 +3,34 @@ package org.matsim.contrib.rlev.charging;
 import org.matsim.contrib.rlev.fleet.ElectricVehicle;
 import org.matsim.contrib.rlev.infrastructure.ChargerSpecification;
 import org.matsim.core.api.experimental.events.EventsManager;
-import java.util.*;
+
+import javax.annotation.Nullable;
+import java.util.Collection;
+import java.util.Objects;
 
 public class DynamicAndQueingChargingLogic implements ChargingLogic {
+	private static final ChargingListener NO_OP_LISTENER = new ChargingListener() {};
     private final ChargingWithQueueingLogic chargingWithQueueingLogic;
     private final DynamicChargingLogic dynamicChargingLogic;
     protected final ChargerSpecification charger;
     private final ChargingStrategy chargingStrategy;
     private final EventsManager eventsManager;
+	private final ChargingListener fallbackListener;
     private boolean isDynamicCharger;
 
 
     public DynamicAndQueingChargingLogic(ChargerSpecification charger, ChargingStrategy chargingStrategy, EventsManager eventsManager) {
+        this(charger, chargingStrategy, eventsManager, null);
+    }
+
+    public DynamicAndQueingChargingLogic(ChargerSpecification charger, ChargingStrategy chargingStrategy, EventsManager eventsManager,
+                                         @Nullable ChargingListener fallbackListener) {
             this.chargingStrategy = Objects.requireNonNull(chargingStrategy);
             this.charger = Objects.requireNonNull(charger);
             this.eventsManager = Objects.requireNonNull(eventsManager);
+			this.fallbackListener = fallbackListener != null ? fallbackListener : NO_OP_LISTENER;
             this.chargingWithQueueingLogic = new ChargingWithQueueingLogic(charger, chargingStrategy, eventsManager);
-            this.dynamicChargingLogic = new DynamicChargingLogic(charger, chargingStrategy, eventsManager);
+            this.dynamicChargingLogic = new DynamicChargingLogic(charger, chargingStrategy, eventsManager, this.fallbackListener);
             this.isDynamicCharger = this.charger.getChargerType().equals("dynamic");
     }
 
@@ -27,10 +38,10 @@ public class DynamicAndQueingChargingLogic implements ChargingLogic {
     @Override
     public void addVehicle(ElectricVehicle ev, double now) {
         if (this.isDynamicCharger){
-            this.dynamicChargingLogic.addVehicle(ev, now);
+            this.dynamicChargingLogic.addVehicle(ev, fallbackListener, now);
         }
         else{
-            this.chargingWithQueueingLogic.addVehicle(ev, now);
+            this.chargingWithQueueingLogic.addVehicle(ev, fallbackListener, now);
         }
     }
 

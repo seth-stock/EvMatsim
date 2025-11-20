@@ -34,6 +34,15 @@ def parse_counts_xml(counts_file):
 
     return counts
 
+
+def _sec_to_time_string(seconds: float) -> str:
+    """Convert seconds to HH:MM:SS (wrapped to 24h)."""
+    seconds = int(seconds) % (24 * 3600)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
 def create_vehicle_definitions(ids, initial_soc):
     root = ET.Element(
         "vehicleDefinitions",
@@ -121,39 +130,66 @@ def create_population_and_plans_xml_counts(
 
     for i, count in enumerate(counts):
         count = int(get_str(count))
-        for j in range(int(count * population_multiplier)):
-            origin_node_id = random.choice(node_ids)
-            dest_node_id = random.choice(node_ids)
-            origin_node = node_coords[origin_node_id]
-            dest_node = node_coords[dest_node_id]
+        for _ in range(int(count * population_multiplier)):
+            home_node = node_coords[random.choice(node_ids)]
+            work_node = node_coords[random.choice(node_ids)]
+            errand_node = node_coords[random.choice(node_ids)]
+
             person = ET.SubElement(plans, "person", id=str(person_count))
             person_ids.append(person_count)
             person_count += 1
             plan = ET.SubElement(person, "plan", selected="yes")
-            start_time = (i + 1) % 24
-            end_time = (start_time + 8) % 24
-            start_time_str = (
-                f"0{start_time}:00:00" if start_time < 10 else f"{start_time}:00:00"
-            )
-            end_time_str = (
-                f"0{end_time}:00:00" if end_time < 10 else f"{end_time}:00:00"
-            )
+
+            # Daily schedule (seconds)
+            home_depart = ((i + 1) % 24) * 3600 + random.randint(0, 45) * 60
+            work_duration = random.uniform(7, 10) * 3600
+            errand_duration = random.uniform(1, 3) * 3600
+            evening_buffer = random.uniform(1, 2) * 3600
+
+            work_end = home_depart + work_duration
+            errand_end = work_end + errand_duration
+            final_home_start = min(errand_end + evening_buffer, 23.5 * 3600)
+
+            # Home -> Work
             ET.SubElement(
                 plan,
                 "act",
-                type="h",
-                x=str(origin_node[0]),
-                y=str(origin_node[1]),
-                end_time=start_time_str,
+                type="home",
+                x=str(home_node[0]),
+                y=str(home_node[1]),
+                end_time=_sec_to_time_string(home_depart),
             )
             ET.SubElement(plan, "leg", mode="car")
+
+            # Work -> Errand
             ET.SubElement(
                 plan,
                 "act",
-                type="h",
-                x=str(dest_node[0]),
-                y=str(dest_node[1]),
-                start_time=end_time_str,
+                type="work",
+                x=str(work_node[0]),
+                y=str(work_node[1]),
+                end_time=_sec_to_time_string(work_end),
+            )
+            ET.SubElement(plan, "leg", mode="car")
+
+            # Errand/Leisure stop
+            ET.SubElement(
+                plan,
+                "act",
+                type="leisure",
+                x=str(errand_node[0]),
+                y=str(errand_node[1]),
+                end_time=_sec_to_time_string(errand_end),
+            )
+            ET.SubElement(plan, "leg", mode="car")
+
+            # Return home for the night (final activity keeps open end)
+            ET.SubElement(
+                plan,
+                "act",
+                type="home",
+                x=str(home_node[0]),
+                y=str(home_node[1]),
             )
 
     vehicle_tree = create_vehicle_definitions(person_ids, initial_soc)

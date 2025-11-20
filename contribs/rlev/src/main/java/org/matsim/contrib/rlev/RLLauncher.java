@@ -8,6 +8,8 @@ import org.matsim.core.controler.OutputDirectoryHierarchy;
 import org.matsim.contrib.rlev.temperature.TemperatureChangeConfigGroup;
 
 import com.google.inject.Inject;
+
+import java.util.Set;
 import com.google.inject.Provider;
 import org.matsim.api.core.v01.TransportMode;
 import org.matsim.contrib.rlev.charging.ChargingPower;
@@ -28,6 +30,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.stream.Stream;
+import org.matsim.core.config.ConfigGroup;
+import org.matsim.core.config.groups.GlobalConfigGroup;
+import org.matsim.core.config.groups.QSimConfigGroup;
+
 
 /**
  * Minimal launcher that:
@@ -39,6 +45,8 @@ import java.util.stream.Stream;
  * and ControllerConfigGroup.OverwriteFileSetting, which changed in recent MATSim.
  */
 public final class RLLauncher {
+
+    public static final int DEFAULT_SIM_THREADS = 12;
 
     private RLLauncher() { }
 
@@ -67,23 +75,75 @@ public final class RLLauncher {
                 new EvConfigGroup(),
                 new TemperatureChangeConfigGroup());
 
+        configureExecution(config, outputDir, fastOpts);
+
+        
+
+        // 3) Launch MATSim
+		removeLegacyActivityParams(config.planCalcScore(), Set.of("home", "work", "leisure"));
+		ensureActivityParams(config.planCalcScore(), "h", 12 * 3600);
+		ensureActivityParams(config.planCalcScore(), "w", 8 * 3600);
+
+        final Controler controler = createControler(config);
+        controler.run();
+    }
+
+    public static void configureExecution(Config config, String outputDir, boolean fastOpts) {
+        double targetTimeStep = 3.0;
+        config.qsim().setTimeStepSize(targetTimeStep);
+
         // Force EV stats writers for PPO reward extraction
         EvConfigGroup evCfg = ConfigUtils.addOrGetModule(config, EvConfigGroup.class);
         evCfg.timeProfiles = true;
         evCfg.chargerPowerTimeProfiles = true;
+        int discreteStep = Math.max(1, (int)Math.round(targetTimeStep));
+        evCfg.chargeTimeStep = discreteStep;
+        evCfg.auxDischargeTimeStep = discreteStep;
 
         // Ensure output directory is what Python side requested
         config.controler().setOutputDirectory(outputDir);
         config.controler().setOverwriteFileSetting(OutputDirectoryHierarchy.OverwriteFileSetting.deleteDirectoryIfExists);
 
-        // Optionally reduce threading etc. for fast/debug runs
-        if (fastOpts) {
-            config.global().setNumberOfThreads(1);
+        int targetThreads = DEFAULT_SIM_THREADS;
+        if (!hasExplicitParam(config.getModule(GlobalConfigGroup.GROUP_NAME), "numberOfThreads")) {
+            config.global().setNumberOfThreads(targetThreads);
+        }
+        if (!hasExplicitParam(config.getModule(QSimConfigGroup.GROUP_NAME), "numberOfThreads")) {
+            config.qsim().setNumberOfThreads(targetThreads);
         }
 
-        // 3) Launch MATSim
-        ensureActivityParams(config.planCalcScore(), "h", 12 * 3600);
+        if (!fastOpts) {
+            ConfigGroup eventsModule = config.getModule("parallelEventHandling");
+            if (eventsModule == null) {
+                eventsModule = new ConfigGroup("parallelEventHandling");
+                config.addModule(eventsModule);
+            }
+            eventsModule.addParam("oneThreadPerHandler", "true");
+            eventsModule.addParam("synchronizeOnSimSteps", "false");
 
+            String existingQueue = eventsModule.getValue("eventsQueueSize");
+            long queueSize = 0;
+            if (existingQueue != null) {
+                try {
+                    queueSize = Long.parseLong(existingQueue.trim());
+                } catch (NumberFormatException ignored) {
+                    queueSize = 0;
+                }
+            }
+            if (queueSize < 10_000_000L) {
+                eventsModule.addParam("eventsQueueSize", "1000000");
+            }
+
+            eventsModule.getParams().remove("numberOfThreads");
+        } else {
+            ConfigGroup eventsModule = config.getModule("parallelEventHandling");
+            if (eventsModule != null && !hasExplicitParam(eventsModule, "numberOfThreads")) {
+                eventsModule.addParam("numberOfThreads", Integer.toString(targetThreads));
+            }
+        }
+    }
+
+    public static Controler createControler(Config config) {
         final Controler controler = new Controler(config);
         controler.addOverridingModule(new AbstractModule() {
             @Override
@@ -112,22 +172,36 @@ public final class RLLauncher {
                 addRoutingModuleBinding(TransportMode.car).toProvider(new EvNetworkRoutingProvider(TransportMode.car));
             }
         });
-        controler.run();
+        return controler;
+    }
+
+    private static boolean hasExplicitParam(ConfigGroup module, String paramName) {
+        return module != null && module.getValue(paramName) != null;
     }
 
     /**
      * Ensures the plan scoring configuration contains default parameters for the given activity type.
      */
-    private static void ensureActivityParams(PlanCalcScoreConfigGroup planCalcScore, String type, double typicalDurationSeconds) {
-        if (planCalcScore.getActivityParams(type) == null) {
-            PlanCalcScoreConfigGroup.ActivityParams params = new PlanCalcScoreConfigGroup.ActivityParams(type);
-            params.setTypicalDuration(typicalDurationSeconds);
-            planCalcScore.addActivityParams(params);
-            System.out.println("[RLLauncher] Added default planCalcScore params for activity type '" + type + "'.");
-        } else {
-            System.out.println("[RLLauncher] Using existing planCalcScore params for activity type '" + type + "'.");
-        }
-    }
+	static void ensureActivityParams(PlanCalcScoreConfigGroup planCalcScore, String type, double typicalDurationSeconds) {
+		if (planCalcScore.getActivityParams(type) == null) {
+			PlanCalcScoreConfigGroup.ActivityParams params = new PlanCalcScoreConfigGroup.ActivityParams(type);
+			params.setTypicalDuration(typicalDurationSeconds);
+			planCalcScore.addActivityParams(params);
+			System.out.println("[RLLauncher] Added default planCalcScore params for activity type '" + type + "'.");
+		} else {
+			System.out.println("[RLLauncher] Using existing planCalcScore params for activity type '" + type + "'.");
+		}
+	}
+
+	static void removeLegacyActivityParams(PlanCalcScoreConfigGroup planCalcScore, Set<String> deprecatedTypes) {
+		for (String type : deprecatedTypes) {
+			PlanCalcScoreConfigGroup.ActivityParams params = planCalcScore.getActivityParams(type);
+			if (params != null) {
+				planCalcScore.getActivityParams().remove(params);
+				System.out.println("[RLLauncher] Removed legacy planCalcScore params for activity type '" + type + "'.");
+			}
+		}
+	}
 
     /**
      * Reads the original config XML and strips legacy/problematic modules.
@@ -141,6 +215,10 @@ public final class RLLauncher {
         String cleaned = xml.replaceAll("(?is)<\\s*module\\s+name\\s*=\\s*\"counts\"\\s*>.*?<\\s*/\\s*module\\s*>", "");
 
         cleaned = cleaned.replace("module name=\"controller\"", "module name=\"controler\"");
+
+        // Older configs often keep a boolean "enable" flag inside modules such as parallelEventHandling.
+        // That attribute no longer exists in current MATSim, so strip it proactively to avoid parser errors.
+        cleaned = cleaned.replaceAll("(?is)<\\s*param\\s+name\\s*=\\s*\"enable\"\\s+value\\s*=\\s*\"(true|false)\"\\s*/?\\s*>", "");
 
         final Path tempDir = Files.createTempDirectory("rlev_cfg_");
         final Path cleanedPath = tempDir.resolve("cleaned_config.xml");

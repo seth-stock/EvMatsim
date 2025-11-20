@@ -44,6 +44,15 @@ public final class ChargerOccupancyXYDataCollector implements MobsimInitializedL
 
 	private CompactCSVWriter writer;
 
+	private void ensureWriterInitialized() {
+		if (writer == null) {
+			String file = matsimServices.getControlerIO()
+					.getIterationFilename(matsimServices.getIterationNumber(), "charger_occupancy_absolute");
+			writer = new CompactCSVWriter(IOUtils.getBufferedWriter(file + ".xy.gz"));
+			writer.writeNext(new CSVLineBuilder().addAll("time", "id", "x", "y", "plugs", "plugged", "queued", "assigned"));
+		}
+	}
+
 	@Inject
 	ChargerOccupancyXYDataCollector(ChargingInfrastructure chargingInfrastructure, MatsimServices matsimServices) {
 		this.chargingInfrastructure = chargingInfrastructure;
@@ -52,13 +61,13 @@ public final class ChargerOccupancyXYDataCollector implements MobsimInitializedL
 
 	@Override
 	public void notifyMobsimInitialized(@SuppressWarnings("rawtypes") MobsimInitializedEvent e) {
-		String file = matsimServices.getControlerIO().getIterationFilename(matsimServices.getIterationNumber(), "charger_occupancy_absolute");
-		writer = new CompactCSVWriter(IOUtils.getBufferedWriter(file + ".xy.gz"));
-		writer.writeNext(new CSVLineBuilder().addAll("time", "id", "x", "y", "plugs", "plugged", "queued", "assigned"));
+		ensureWriterInitialized();
 	}
 
 	@Override
 	public void notifyMobsimBeforeSimStep(@SuppressWarnings("rawtypes") MobsimBeforeSimStepEvent e) {
+		ensureWriterInitialized();
+
 		final int interval = 300;
 		if (e.getSimulationTime() % interval == 0) {
 			String time = (int)e.getSimulationTime() + "";
@@ -81,6 +90,9 @@ public final class ChargerOccupancyXYDataCollector implements MobsimInitializedL
 
 	@Override
 	public void notifyMobsimBeforeCleanup(@SuppressWarnings("rawtypes") MobsimBeforeCleanupEvent e) {
-		writer.close();
+		if (writer != null) {
+			writer.close();
+			writer = null;
+		}
 	}
 }

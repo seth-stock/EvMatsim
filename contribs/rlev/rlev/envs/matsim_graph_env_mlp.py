@@ -9,8 +9,8 @@ class MatsimGraphEnvMlp(MatsimGraphEnv):
     A custom Gymnasium environment for Matsim graph-based simulations.
     """
 
-    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python"):
-        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend)
+    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python", fast_opts: bool = False, seed: int | None = None):
+        super().__init__(config_path, num_agents=num_agents, save_dir=save_dir, backend=backend, fast_opts=fast_opts, seed=seed)
 
         self.observation_space = spaces.Box(
             low=0,
@@ -19,7 +19,7 @@ class MatsimGraphEnvMlp(MatsimGraphEnv):
             dtype=np.float32,
         )
 
-    def reset(self, **kwargs):
+    def reset(self, *, seed=None, options=None):
         """
         Reset the environment to its initial state.
 
@@ -27,6 +27,7 @@ class MatsimGraphEnvMlp(MatsimGraphEnv):
             np.ndarray: Initial state of the environment.
             dict: Additional information.
         """
+        self._maybe_update_seed(seed)
         return self.dataset.linegraph.x.numpy(), dict(info="info")
 
     def step(self, actions):

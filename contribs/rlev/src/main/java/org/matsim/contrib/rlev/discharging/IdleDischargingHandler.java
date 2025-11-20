@@ -63,6 +63,7 @@ public final class IdleDischargingHandler
 
 	private final VehicleProvider vehicleProvider;
 	private final int auxDischargeTimeStep;
+	private double nextAuxDischargeTime;
 	private final EventsManager eventsManager;
 
 	private final ConcurrentMap<Id<Person>, VehicleAndLink> vehicles = new ConcurrentHashMap<>();
@@ -70,22 +71,32 @@ public final class IdleDischargingHandler
 	@Inject
 	IdleDischargingHandler(VehicleProvider vehicleProvider, EvConfigGroup evCfg, EventsManager eventsManager) {
 		this.vehicleProvider = vehicleProvider;
-		this.auxDischargeTimeStep = evCfg.auxDischargeTimeStep;
+		this.auxDischargeTimeStep = Math.max(1, evCfg.auxDischargeTimeStep);
+		this.nextAuxDischargeTime = 0.0;
 		this.eventsManager = eventsManager;
 	}
 
 	@Override
 	public void notifyMobsimAfterSimStep(@SuppressWarnings("rawtypes") MobsimAfterSimStepEvent e) {
-		if (e.getSimulationTime() % auxDischargeTimeStep == 0) {
+		if (auxDischargeTimeStep <= 0 || vehicles.isEmpty()) {
+			return;
+		}
+		double simTime = e.getSimulationTime();
+		if (simTime + 1e-9 < nextAuxDischargeTime) {
+			return;
+		}
+
+		while (simTime + 1e-9 >= nextAuxDischargeTime) {
 			for (VehicleAndLink vl : vehicles.values()) {
 				ElectricVehicle ev = vl.vehicle;
-				double energy = ev.getAuxEnergyConsumption().calcEnergyConsumption(e.getSimulationTime(), auxDischargeTimeStep, vl.linkId);
+				double energy = ev.getAuxEnergyConsumption().calcEnergyConsumption(simTime, auxDischargeTimeStep, vl.linkId);
 				ev.getBattery()
 						.dischargeEnergy(energy, missingEnergy -> eventsManager.processEvent(
-								new MissingEnergyEvent(e.getSimulationTime(), ev.getId(), vl.linkId, missingEnergy)));
+								new MissingEnergyEvent(simTime, ev.getId(), vl.linkId, missingEnergy)));
 				eventsManager.processEvent(
-						new IdlingEnergyConsumptionEvent(e.getSimulationTime(), ev.getId(), vl.linkId, energy, ev.getBattery().getCharge()));
+						new IdlingEnergyConsumptionEvent(simTime, ev.getId(), vl.linkId, energy, ev.getBattery().getCharge()));
 			}
+			nextAuxDischargeTime += auxDischargeTimeStep;
 		}
 	}
 

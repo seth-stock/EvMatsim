@@ -3,6 +3,8 @@ package org.matsim.contrib.rlev.stats;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.matsim.api.core.v01.Id;
 import org.matsim.contrib.rlev.stats.util.TimeDiscretizer;
 import org.matsim.contrib.rlev.EvConfigGroup;
@@ -20,10 +22,17 @@ import org.matsim.vehicles.Vehicle;
 import com.google.inject.Inject;
 
 public final class ChargerPowerTimeProfileCalculator implements ChargingStartEventHandler, ChargingEndEventHandler {
+	private static final Logger LOG = LogManager.getLogger(ChargerPowerTimeProfileCalculator.class);
+	private static final double MIN_DURATION_SECONDS = 1.0;
+	private static final int MAX_DETAILED_WARNINGS = 10;
 
 	private final Map<Id<Charger>, double[]> chargerProfiles = new HashMap<>();
 	private final Map<Id<Vehicle>, Double> chargingStartTimeMap = new HashMap<>();
 	private final Map<Id<Vehicle>, Double> chargingStartEnergyMap = new HashMap<>();
+	private long missingStartSkipCount = 0;
+	private long shortDurationSkipCount = 0;
+	private int missingStartDetailedWarnings = 0;
+	private int shortDurationDetailedWarnings = 0;
 
 	private final TimeDiscretizer timeDiscretizer;
 	private final double qsimEndTime;
@@ -55,9 +64,20 @@ public final class ChargerPowerTimeProfileCalculator implements ChargingStartEve
 	@Override
 
 	public void handleEvent(ChargingEndEvent event) {
-		double chargingTimeIn_h = (event.getTime() - chargingStartTimeMap.get(event.getVehicleId())) / 3600.0;
-		double averagePowerIn_kW = (EvUnits.J_to_kWh(event.getCharge()) - chargingStartEnergyMap.get(event.getVehicleId())) / chargingTimeIn_h;
-		increment(averagePowerIn_kW, event.getChargerId(), chargingStartTimeMap.get(event.getVehicleId()), event.getTime());
+		Double chargingStartTime = chargingStartTimeMap.remove(event.getVehicleId());
+		Double chargingStartEnergy = chargingStartEnergyMap.remove(event.getVehicleId());
+		if (chargingStartTime == null || chargingStartEnergy == null) {
+			recordMissingStart(event);
+			return;
+		}
+		double chargingDurationSeconds = event.getTime() - chargingStartTime;
+		if (chargingDurationSeconds <= MIN_DURATION_SECONDS) {
+			recordShortDuration(event, chargingDurationSeconds);
+			return;
+		}
+		double chargingTimeIn_h = chargingDurationSeconds / 3600.0;
+		double averagePowerIn_kW = (EvUnits.J_to_kWh(event.getCharge()) - chargingStartEnergy) / chargingTimeIn_h;
+		increment(averagePowerIn_kW, event.getChargerId(), chargingStartTime, event.getTime());
 	}
 	private void increment(double averagePower, Id<Charger> chargerId, double chargingStartTime, double chargingEndTime) {
 
@@ -78,5 +98,43 @@ public final class ChargerPowerTimeProfileCalculator implements ChargingStartEve
 
 	public TimeDiscretizer getTimeDiscretizer() {
 		return timeDiscretizer;
+	}
+
+	private void recordMissingStart(ChargingEndEvent event) {
+		missingStartSkipCount++;
+		if (missingStartDetailedWarnings < MAX_DETAILED_WARNINGS) {
+			LOG.warn("ChargingEndEvent for vehicle {} at charger {} arrived without matching start information. Skipping power profile update.",
+					event.getVehicleId(), event.getChargerId());
+		} else if (missingStartDetailedWarnings == MAX_DETAILED_WARNINGS) {
+			LOG.warn("Further missing ChargingStartEvent warnings suppressed.");
+		}
+		missingStartDetailedWarnings++;
+	}
+
+	private void recordShortDuration(ChargingEndEvent event, double durationSeconds) {
+		shortDurationSkipCount++;
+		if (shortDurationDetailedWarnings < MAX_DETAILED_WARNINGS) {
+			LOG.warn("ChargingEndEvent for vehicle {} at charger {} has duration {}s (<= {}s). Skipping.", event.getVehicleId(), event.getChargerId(),
+					Math.round(durationSeconds * 10.0) / 10.0, MIN_DURATION_SECONDS);
+		} else if (shortDurationDetailedWarnings == MAX_DETAILED_WARNINGS) {
+			LOG.warn("Further short charging duration warnings suppressed.");
+		}
+		shortDurationDetailedWarnings++;
+	}
+
+	@Override
+	public void reset(int iteration) {
+		if (missingStartSkipCount > 0) {
+			LOG.warn("Iteration {}: skipped {} charging end events without matching start information.", iteration, missingStartSkipCount);
+		}
+		if (shortDurationSkipCount > 0) {
+			LOG.warn("Iteration {}: skipped {} charging sessions shorter than {}s.", iteration, shortDurationSkipCount, MIN_DURATION_SECONDS);
+		}
+		missingStartSkipCount = 0;
+		shortDurationSkipCount = 0;
+		missingStartDetailedWarnings = 0;
+		shortDurationDetailedWarnings = 0;
+		chargingStartTimeMap.clear();
+		chargingStartEnergyMap.clear();
 	}
 }

@@ -19,7 +19,8 @@
 
 package org.matsim.contrib.rlev.charging;
 
-import com.google.common.base.Preconditions;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.matsim.api.core.v01.Id;
 import org.matsim.contrib.rlev.fleet.ElectricVehicle;
 import org.matsim.contrib.rlev.infrastructure.ChargerSpecification;
@@ -30,6 +31,9 @@ import java.util.*;
 import java.util.concurrent.LinkedBlockingQueue;
 
 public class ChargingWithQueueingLogic implements ChargingLogic {
+	private static final ChargingListener NO_OP_LISTENER = new ChargingListener() {
+	};
+	private static final Logger LOG = LogManager.getLogger(ChargingWithQueueingLogic.class);
 	protected final ChargerSpecification charger;
 	private final ChargingStrategy chargingStrategy;
 	private final EventsManager eventsManager;
@@ -61,24 +65,27 @@ public class ChargingWithQueueingLogic implements ChargingLogic {
 			if (chargingStrategy.isChargingCompleted(ev)) {
 				evIter.remove();
 				eventsManager.processEvent(new ChargingEndEvent(now, charger.getId(), ev.getId(), ev.getBattery().getCharge()));
-				listeners.remove(ev.getId()).notifyChargingEnded(ev, now);
+				removeListenerOrFallback(ev.getId(), "end charging").notifyChargingEnded(ev, now);
 			}
 		}
 
 		int queuedToPluggedCount = Math.min(queuedVehicles.size(), charger.getPlugCount() - pluggedVehicles.size());
 		for (int i = 0; i < queuedToPluggedCount; i++) {
-			plugVehicle(queuedVehicles.poll(), now);
+			ElectricVehicle queuedEv = queuedVehicles.poll();
+			if (queuedEv == null) {
+				LOG.warn("Charger {} expected queued vehicle to plug at t={} but queue was empty. Skipping.", charger.getId(), now);
+				break;
+			}
+			plugVehicle(queuedEv, now);
 		}
 
-		var arrivingVehiclesIter = arrivingVehicles.iterator();
-		while (arrivingVehiclesIter.hasNext()) {
-			var ev = arrivingVehiclesIter.next();
+		ElectricVehicle arrivingEv;
+		while ((arrivingEv = arrivingVehicles.poll()) != null) {
 			if (pluggedVehicles.size() < charger.getPlugCount()) {
-				plugVehicle(ev, now);
+				plugVehicle(arrivingEv, now);
 			} else {
-				queueVehicle(ev, now);
+				queueVehicle(arrivingEv, now);
 			}
-			arrivingVehiclesIter.remove();
 		}
 	}
 
@@ -90,31 +97,56 @@ public class ChargingWithQueueingLogic implements ChargingLogic {
 
 	@Override
 	public void addVehicle(ElectricVehicle ev, ChargingListener chargingListener, double now) {
+		ChargingListener effectiveListener = chargingListener != null ? chargingListener : NO_OP_LISTENER;
+		if (listeners.containsKey(ev.getId())) {
+			if (LOG.isDebugEnabled()) {
+				LOG.debug("Vehicle {} already managed by charger {}. Ignoring duplicate add request at t={}.",
+						ev.getId(), charger.getId(), now);
+			}
+			return;
+		}
+		listeners.put(ev.getId(), effectiveListener);
 		arrivingVehicles.add(ev);
-		listeners.put(ev.getId(), chargingListener);
 	}
 
 	@Override
 	public void removeVehicle(ElectricVehicle ev, double now) {
 		if (pluggedVehicles.remove(ev.getId()) != null) {// successfully removed
 			eventsManager.processEvent(new ChargingEndEvent(now, charger.getId(), ev.getId(), ev.getBattery().getCharge()));
-			listeners.remove(ev.getId()).notifyChargingEnded(ev, now);
+			removeListenerOrFallback(ev.getId(), "end charging (forced)").notifyChargingEnded(ev, now);
 
 			if (!queuedVehicles.isEmpty()) {
-				plugVehicle(queuedVehicles.poll(), now);
+				ElectricVehicle queuedEv = queuedVehicles.poll();
+				if (queuedEv != null) {
+					plugVehicle(queuedEv, now);
+				}
+			}
+		} else if (queuedVehicles.remove(ev)) {
+			eventsManager.processEvent(new QuitQueueAtChargerEvent(now, charger.getId(), ev.getId()));
+			listeners.remove(ev.getId());
+		} else if (arrivingVehicles.remove(ev)) {
+			ChargingListener listener = listeners.remove(ev.getId());
+			if (listener != null) {
+				LOG.debug("Vehicle {} removed from arriving queue of charger {} before being queued/plugged (t={}).",
+						ev.getId(), charger.getId(), now);
 			}
 		} else {
-			// make sure ev was in the queue
-			Preconditions.checkState(queuedVehicles.remove(ev), "Vehicle (%s) is neither queued nor plugged at charger (%s)", ev.getId(),
-				charger.getId());
-			eventsManager.processEvent(new QuitQueueAtChargerEvent(now, charger.getId(), ev.getId()));
+			ChargingListener listener = listeners.remove(ev.getId());
+			if (listener != null) {
+				LOG.warn("Vehicle {} requested removal from charger {} but was not queued or plugged anymore (t={}). "
+						+ "Treating as already handled.", ev.getId(), charger.getId(), now);
+			} else {
+				LOG.warn("Vehicle {} requested removal from charger {} but no listener or state entry was found (t={}). "
+						+ "This can happen when re-registering after a completed charge.", ev.getId(), charger.getId(),
+						now);
+			}
 		}
 	}
 
 	private void queueVehicle(ElectricVehicle ev, double now) {
 		queuedVehicles.add(ev);
 		eventsManager.processEvent(new QueuedAtChargerEvent(now, charger.getId(), ev.getId()));
-		listeners.get(ev.getId()).notifyVehicleQueued(ev, now);
+		getListenerOrFallback(ev.getId(), "queue").notifyVehicleQueued(ev, now);
 	}
 
 	private void plugVehicle(ElectricVehicle ev, double now) {
@@ -122,7 +154,27 @@ public class ChargingWithQueueingLogic implements ChargingLogic {
 			throw new IllegalArgumentException();
 		}
 		eventsManager.processEvent(new ChargingStartEvent(now, charger.getId(), ev.getId(), ev.getBattery().getCharge()));
-		listeners.get(ev.getId()).notifyChargingStarted(ev, now);
+		getListenerOrFallback(ev.getId(), "start charging").notifyChargingStarted(ev, now);
+	}
+
+	private ChargingListener getListenerOrFallback(Id<Vehicle> vehicleId, String context) {
+		ChargingListener listener = listeners.get(vehicleId);
+		if (listener == null) {
+			LOG.warn("Vehicle {} has no registered charging listener when attempting to {} at charger {}. Using NO-OP listener.",
+					vehicleId, context, charger.getId());
+			return NO_OP_LISTENER;
+		}
+		return listener;
+	}
+
+	private ChargingListener removeListenerOrFallback(Id<Vehicle> vehicleId, String context) {
+		ChargingListener listener = listeners.remove(vehicleId);
+		if (listener == null) {
+			LOG.warn("Vehicle {} has no registered charging listener when attempting to {} at charger {}. Using NO-OP listener.",
+					vehicleId, context, charger.getId());
+			return NO_OP_LISTENER;
+		}
+		return listener;
 	}
 
 	private final Collection<ElectricVehicle> unmodifiablePluggedVehicles = Collections.unmodifiableCollection(pluggedVehicles.values());

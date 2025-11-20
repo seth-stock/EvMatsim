@@ -71,7 +71,15 @@ public final class OhdeSlaskiDriveEnergyConsumption implements DriveEnergyConsum
 		}
 
 		double avgSpeed = link.getLength() / travelTime;
+		if (Double.isNaN(avgSpeed) || Double.isInfinite(avgSpeed)) {
+			return 0;
+		}
 		int idx = (int)Math.round(avgSpeed * SPEED_STEPS_PER_UNIT);
+		if (idx < 0) {
+			idx = 0;
+		} else if (idx >= POWER.length) {
+			idx = POWER.length - 1;
+		}
 		return POWER[idx] * travelTime;
 	}
 }

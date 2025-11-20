@@ -53,6 +53,18 @@ def _build_uber_jar(project_root: Path) -> bool:
         return False
     return True
 
+def ensure_uber_jar() -> Path:
+    """
+    Ensure the shaded jar exists (building it via Maven if necessary) and
+    return its absolute path.
+    """
+    project_root = _find_project_root()
+    jar_path = project_root / "target" / "rlev-uber.jar"
+    if not jar_path.exists():
+        if not _build_uber_jar(project_root):
+            raise RuntimeError("Failed to build rlev-uber.jar")
+    return jar_path
+
 def run_controler(config_path: Path | str,
                   output_dir: Path | str,
                   fast_opts: bool = True,
@@ -66,12 +78,10 @@ def run_controler(config_path: Path | str,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     project_root = _find_project_root()
-    jar_path = project_root / "target" / "rlev-uber.jar"
-
-    # Auto-build the jar if missing
-    if not jar_path.exists():
-        if not _build_uber_jar(project_root):
-            return 1, "failed to build rlev-uber.jar"
+    try:
+        jar_path = ensure_uber_jar()
+    except RuntimeError as exc:
+        return 1, str(exc)
 
     # Prepare arguments for RLLauncher
     #   <config> <outputDir> <fastOpts(true/false)> [endTimeSec]

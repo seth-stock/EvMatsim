@@ -1,24 +1,25 @@
 package org.matsim.contrib.rlev.charging;
 
+import com.google.common.base.Preconditions;
 import com.google.inject.Inject;
 import com.google.inject.Provider;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+
 import org.matsim.api.core.v01.Id;
 import org.matsim.contrib.rlev.fleet.ElectricVehicle;
 import org.matsim.contrib.rlev.infrastructure.ChargerSpecification;
 import org.matsim.core.api.experimental.events.EventsManager;
 import org.matsim.vehicles.Vehicle;
 
-import javax.annotation.Nullable;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.Function;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import java.util.*;
+
+import org.matsim.contrib.rlev.charging.ChargingLogic;
+import org.matsim.contrib.rlev.fleet.ElectricVehicle;
+import org.matsim.contrib.rlev.infrastructure.ChargerSpecification;
+import org.matsim.core.api.experimental.events.EventsManager;
 
 public class DynamicChargingLogic implements ChargingLogic {
 	private static final ChargingListener NO_OP_LISTENER = new ChargingListener() {};
@@ -26,27 +27,22 @@ public class DynamicChargingLogic implements ChargingLogic {
 	private static final Logger LOG = LogManager.getLogger(DynamicChargingLogic.class);
 	private final ChargingStrategy chargingStrategy;
 	private final EventsManager eventsManager;
-	private final ChargingListener fallbackListener;
 
-	private final Map<Id<Vehicle>, ElectricVehicle> vehiclesOnChargingLink = new ConcurrentHashMap<>();
-	private final Queue<ElectricVehicle> arrivingVehicles = new ConcurrentLinkedQueue<>();
-	private final Map<Id<Vehicle>, ChargingListener> listeners = new ConcurrentHashMap<>();
+	private final Map<Id<Vehicle>, ElectricVehicle> vehiclesOnChargingLink = new LinkedHashMap<>();
+	private final Queue<ElectricVehicle> arrivingVehicles = new LinkedBlockingQueue<>();
+	private final Map<Id<Vehicle>, ChargingListener> listeners = new LinkedHashMap<>();
 
     public DynamicChargingLogic(ChargerSpecification charger, ChargingStrategy chargingStrategy, EventsManager eventsManager){
-		this(charger, chargingStrategy, eventsManager, null);
-	}
-
-	public DynamicChargingLogic(ChargerSpecification charger, ChargingStrategy chargingStrategy, EventsManager eventsManager,
-			@Nullable ChargingListener fallbackListener) {
         this.chargingStrategy = Objects.requireNonNull(chargingStrategy);
 		this.charger = Objects.requireNonNull(charger);
 		this.eventsManager = Objects.requireNonNull(eventsManager);
-		this.fallbackListener = fallbackListener != null ? fallbackListener : NO_OP_LISTENER;
 	}
     
     @Override
     public void chargeVehicles(double chargePeriod, double now) {
-		for (ElectricVehicle ev : vehiclesOnChargingLink.values()) {
+		Iterator<ElectricVehicle> evIter = vehiclesOnChargingLink.values().iterator();
+		while (evIter.hasNext()) {
+			ElectricVehicle ev = evIter.next();
 			// with dynamic charging we charge the vehicle as it drives on the link
 			double oldCharge = ev.getBattery().getCharge();
 			double energy = ev.getChargingPower().calcChargingPower(charger) * chargePeriod;
@@ -55,9 +51,11 @@ public class DynamicChargingLogic implements ChargingLogic {
 			eventsManager.processEvent(new EnergyChargedEvent(now, charger.getId(), ev.getId(), newCharge - oldCharge, newCharge));
 		}
 
-		ElectricVehicle ev;
-		while ((ev = arrivingVehicles.poll()) != null) {
+		var arrivingVehiclesIter = arrivingVehicles.iterator();
+		while (arrivingVehiclesIter.hasNext()) {
+			var ev = arrivingVehiclesIter.next();
 			plugVehicle(ev, now);
+			arrivingVehiclesIter.remove();
 		}
 	}
 
@@ -67,24 +65,24 @@ public class DynamicChargingLogic implements ChargingLogic {
 		}
 		eventsManager.processEvent(new ChargingStartEvent(now, charger.getId(), ev.getId(), ev.getBattery().getCharge()));
 		ChargingListener listener = listeners.get(ev.getId());
-		if (listener == null) {
-			listener = fallbackListener;
-			LOG.warn("Vehicle {} started charging on {} without a registered listener. Using fallback listener.", ev.getId(), charger.getId());
+		if (listener != null) {
+			listener.notifyChargingStarted(ev, now);
+		} else {
+			LOG.warn("Vehicle {} started charging on {} without a registered listener", ev.getId(), charger.getId());
 		}
-		listener.notifyChargingStarted(ev, now);
 	}
 
 	@Override
 	public void addVehicle(ElectricVehicle ev, double now) {
-		addVehicle(ev, fallbackListener, now);
+		addVehicle(ev, new ChargingListener() {
+		}, now);
 	}
 
 	@Override
 	public void addVehicle(ElectricVehicle ev, ChargingListener chargingListener, double now) {
-		ChargingListener listener = chargingListener != null ? chargingListener : fallbackListener;
-		if (listeners.containsKey(ev.getId()) || vehiclesOnChargingLink.containsKey(ev.getId())) {
-			LOG.debug("Vehicle {} already scheduled on dynamic charger {}. Ignoring duplicate add request.", ev.getId(), charger.getId());
-			return;
+				ChargingListener listener = chargingListener;
+		if (listener == null) {
+			listener = NO_OP_LISTENER;
 		}
 		arrivingVehicles.add(ev);
 		listeners.put(ev.getId(), listener);
@@ -95,17 +93,16 @@ public class DynamicChargingLogic implements ChargingLogic {
 		if (vehiclesOnChargingLink.remove(ev.getId()) != null) {// successfully removed
 			eventsManager.processEvent(new ChargingEndEvent(now, charger.getId(), ev.getId(), ev.getBattery().getCharge()));
 			ChargingListener listener = listeners.remove(ev.getId());
-			if (listener == null) {
-				listener = fallbackListener;
-				LOG.warn("Vehicle {} finished charging on {} without a registered listener. Using fallback listener.", ev.getId(), charger.getId());
+			if (listener != null) {
+				listener.notifyChargingEnded(ev, now);
+			} else {
+				LOG.warn("Vehicle {} finished charging on {} without a registered listener", ev.getId(), charger.getId());
 			}
-			listener.notifyChargingEnded(ev, now);
-		} else if (arrivingVehicles.remove(ev)) {
-			listeners.remove(ev.getId());
-		} else {
-			// This happens when the program first starts and a vehicle is placed on a dynamic link but not added to a charger
-			// throw new IllegalArgumentException("Attempted to remove vehicle from dynamic charger on link when vehicle was not on link");
 		}
+        else{
+			// This happens when the program first starts and a vehicle is placed on a dynamic link but not added to a charger
+            // throw new IllegalArgumentException("Attempted to remove vehicle from dynamic charger on link when vehicle was not on link");
+        }
 	}
 
 	private final Collection<ElectricVehicle> unmodifiablePluggedVehicles = Collections.unmodifiableCollection(vehiclesOnChargingLink.values());

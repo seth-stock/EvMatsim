@@ -15,21 +15,11 @@ from gymnasium import spaces
 from rlev.classes.matsim_xml_dataset import MatsimXMLDataset
 from pathlib import Path
 from rlev.classes.chargers import Charger, StaticCharger, NoneCharger, DynamicCharger
-from typing import List
+from typing import List, Optional, Dict, Any
 from filelock import FileLock
 from rlev.scripts.create_chargers import create_chargers_xml_gymnasium
 
-# Local JVM runner (must exist at rlev/java_jvm.py)
-try:
-    from rlev.java_jvm import run_controler  # (config_path: Path, output_dir: Path, fast_opts: bool=True) -> tuple[int, str]
-except Exception:
-    run_controler = None  # guarded when backend="server"
-try:
-    from rlev import java_jvm
-    run_controler = getattr(java_jvm, "run_controler", None)
-except Exception as e:
-    print(f"[env] import error rlev.java_jvm: {e}", flush=True)
-    run_controler = None
+from rlev.jpype_bridge import run_iteration as run_matsim_iteration
 
 class MatsimGraphEnv(gym.Env):
     """
@@ -40,10 +30,11 @@ class MatsimGraphEnv(gym.Env):
       - "server": old behavior, POST to HTTP reward server.
     """
 
-    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python"):
+    def __init__(self, config_path, num_agents=100, save_dir=None, backend: str = "python", fast_opts: bool = False, seed: Optional[int] = None):
         super().__init__()
         self.save_dir = save_dir
         self.backend = (backend or "python").lower()
+        self.fast_opts = bool(fast_opts)
         if self.backend not in {"python", "server", "jvm"}:
             raise ValueError(f"Unsupported backend={backend}. Choose 'python', 'server', or 'jvm'.")
 
@@ -98,6 +89,11 @@ class MatsimGraphEnv(gym.Env):
         self._charger_efficiency = 0.0
         self._time_efficiency = 0.0
         self._charger_cost = 0.0
+        self._energy_kwh = 0.0
+        self._avg_queue_time_sec = 0.0
+        self._avg_charge_duration_sec = 0.0
+        self._completed_charges = 0
+        self.sim_seed = int(seed) if seed is not None else 0
 
         # Only used if backend == "server"
         self.server_url = os.environ.get("RLEV_SERVER_URL", "http://localhost:8000")
@@ -196,7 +192,7 @@ class MatsimGraphEnv(gym.Env):
             time_reward = 0.0
 
         return charge_reward, time_reward
-    def _finish_reward_common(self, charge_reward: float, time_reward: float):
+    def _finish_reward_common(self, charge_reward: float, time_reward: float, metrics: Optional[Dict[str, Any]] = None):
         """Computes final reward, updates trackers, returns total reward."""
         self._charger_efficiency = float(charge_reward)
         self._time_efficiency = float(time_reward)
@@ -211,12 +207,22 @@ class MatsimGraphEnv(gym.Env):
         charger_cost_reward = charger_cost / float(self.dataset.max_charger_cost)
         reward = charge_reward - time_reward - charger_cost_reward
 
+        if metrics:
+            self._energy_kwh = float(metrics.get("energy_kwh", 0.0))
+            self._avg_queue_time_sec = float(metrics.get("avg_queue_time_sec", 0.0))
+            self._avg_charge_duration_sec = float(metrics.get("avg_charging_duration_sec", 0.0))
+            self._completed_charges = int(metrics.get("completed_charges", 0))
+
         if reward > self.best_reward:
             self.best_reward = reward
 
         self._reward = reward
         self.reward = reward
         return reward
+
+    def _maybe_update_seed(self, seed: Optional[int]) -> None:
+        if seed is not None:
+            self.sim_seed = int(seed)
 
     # <<< FIXED: now a proper class method (dedented) >>>
     def send_reward_request(self, actions):
@@ -270,20 +276,22 @@ class MatsimGraphEnv(gym.Env):
         """
         # Ensure chargers.xml reflects current actions (already written in send_reward_request)
 
-        # Output directory (isolated per rollout)
         output_dir = self.dataset.config_path.parent / "output"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        metrics = run_matsim_iteration(
+            self.dataset.config_path,
+            output_dir,
+            fast_opts=self.fast_opts,
+            end_time_sec=None,
+            seed=self.sim_seed,
+        )
 
-        if run_controler is None:
-            raise RuntimeError("Local JVM backend requested but run_controler is not available.")
-
-        rc, controller_log = run_controler(self.dataset.config_path, output_dir, fast_opts=True)
-        if rc != 0:
-            print(f"[local] MATSim Controler.run() returned non-zero code: {rc}")
-
-        # Read outputs and compute rewards
-        charge_reward, time_reward = self._compute_rewards_from_outputs(output_dir, controller_log=controller_log)
-        reward = self._finish_reward_common(charge_reward, time_reward)
+        total_energy_kwh = max(0.0, float(metrics.get("energy_kwh", 0.0)))
+        completed_charges = max(1, int(metrics.get("completed_charges", 1)))
+        avg_capacity = self.dataset.get_average_energy_capacity(self.dataset.vehicle_xml_path)
+        denom = max(1.0, avg_capacity * completed_charges)
+        charge_reward = total_energy_kwh / denom
+        time_reward = float(metrics.get("avg_leg_duration_sec", 0.0)) / 86400.0
+        reward = self._finish_reward_common(charge_reward, time_reward, metrics=metrics)
         self._sync_outputs_to_scenario(output_dir)
         return reward
 

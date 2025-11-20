@@ -18,6 +18,8 @@
  * *********************************************************************** */
 package org.matsim.contrib.rlev.routing;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.matsim.api.core.v01.Id;
 import org.matsim.api.core.v01.TransportMode;
 import org.matsim.api.core.v01.network.Link;
@@ -54,6 +56,7 @@ import org.matsim.vehicles.Vehicle;
 import com.google.common.collect.ImmutableMap;
 
 import java.util.*;
+import java.util.stream.Stream;
 
 /**
  * This network Routing module adds stages for re-charging into the Route.
@@ -64,6 +67,8 @@ import java.util.*;
  */
 
 final class EvNetworkRoutingModule implements RoutingModule {
+
+	private static final Logger log = LogManager.getLogger(EvNetworkRoutingModule.class);
 
 	private final String mode;
 
@@ -81,6 +86,7 @@ final class EvNetworkRoutingModule implements RoutingModule {
 	private final EvConfigGroup evConfigGroup;
 	private final long numDynamicChargers;
 	private final long numStaticChargers;
+	private final long numTotalChargers;
 
 
 	EvNetworkRoutingModule(final String mode, final Network network, RoutingModule delegate,
@@ -102,14 +108,12 @@ final class EvNetworkRoutingModule implements RoutingModule {
 		this.evConfigGroup = evConfigGroup;
 		this.vehicleSuffix = mode.equals(TransportMode.car) ? "" : "_" + mode;
 		this.numDynamicChargers = chargingInfrastructureSpecification.getChargerSpecifications()
-																		.entrySet()
-																		.stream()
-																		.filter(obj -> obj.getValue()
-																			.getChargerType()
-																			.equals("dynamic"))
-																		.count();
-		this.numStaticChargers = chargingInfrastructureSpecification.getChargerSpecifications()
-								.entrySet().stream().count() - this.numDynamicChargers;
+				.values()
+				.stream()
+				.filter(spec -> "dynamic".equals(spec.getChargerType()))
+				.count();
+		this.numTotalChargers = chargingInfrastructureSpecification.getChargerSpecifications().size();
+		this.numStaticChargers = this.numTotalChargers - this.numDynamicChargers;
 	}
 
 	@Override
@@ -121,7 +125,7 @@ final class EvNetworkRoutingModule implements RoutingModule {
 
 		List<? extends PlanElement> basicRoute = delegate.calcRoute(request);
 		Id<Vehicle> evId = Id.create(person.getId() + vehicleSuffix, Vehicle.class);
-		if (!electricFleetSpecifications.getVehicleSpecifications().containsKey(evId) || this.numStaticChargers == 0) {
+		if (!electricFleetSpecifications.getVehicleSpecifications().containsKey(evId) || this.numTotalChargers == 0) {
 			return basicRoute;
 		} else {
 			Leg basicLeg = (Leg)basicRoute.get(0);
@@ -132,8 +136,9 @@ final class EvNetworkRoutingModule implements RoutingModule {
 					.stream()
 					.mapToDouble(Number::doubleValue)
 					.sum();
-			double charge = ev.getBattery().getCharge() * (0.8 + random.nextDouble() * 0.18);
-			 
+			double batteryCapacity = evspecs.getBatteryCapacity();
+ 			double charge = drawConsumptionBudget(ev.getBattery().getCharge(), batteryCapacity);
+
 			double numberOfStops = Math.floor(estimatedOverallConsumption / charge);
 			if (numberOfStops < 1) {
 				return basicRoute;
@@ -145,39 +150,65 @@ final class EvNetworkRoutingModule implements RoutingModule {
 					if (currentConsumption > charge) {
 						stopLocations.add(e.getKey());
 						currentConsumption = 0;
-						charge = ev.getBattery().getCapacity() * (0.8 + random.nextDouble() * 0.18);
+						charge = drawConsumptionBudget(batteryCapacity, batteryCapacity);
 					}
 				}
 				List<PlanElement> stagedRoute = new ArrayList<>();
 				Facility lastFrom = fromFacility;
 				double lastArrivaltime = departureTime;
 				for (Link stopLocation : stopLocations) {
-
 					StraightLineKnnFinder<Link, ChargerSpecification> straightLineKnnFinder = new StraightLineKnnFinder<>(
 							2, Link::getCoord, s -> network.getLinks().get(s.getLinkId()).getCoord());
-					//We don't want to send the vehicle to a dynamic charger so we filter them out
-					List<ChargerSpecification> nearestChargers = straightLineKnnFinder.findNearest(stopLocation,
-							chargingInfrastructureSpecification.getChargerSpecifications()
-									.values()
-									.stream()
-									.filter(charger -> ev.getChargerTypes().contains(charger.getChargerType()) && 
-									!charger.getChargerType().equals("dynamic")));
-					ChargerSpecification selectedCharger = nearestChargers.get(random.nextInt(1));
+
+					Stream<ChargerSpecification> staticCandidates = chargingInfrastructureSpecification.getChargerSpecifications()
+							.values()
+							.stream()
+							.filter(charger -> ev.getChargerTypes().contains(charger.getChargerType())
+									&& !"dynamic".equals(charger.getChargerType()));
+
+					List<ChargerSpecification> nearestChargers = straightLineKnnFinder.findNearest(stopLocation, staticCandidates);
+
+					if (nearestChargers.isEmpty()) {
+						// fall back to any compatible charger (including dynamic) so we at least keep the plan valid
+						Stream<ChargerSpecification> anyCandidates = chargingInfrastructureSpecification.getChargerSpecifications()
+								.values()
+								.stream()
+								.filter(charger -> ev.getChargerTypes().contains(charger.getChargerType()));
+						nearestChargers = straightLineKnnFinder.findNearest(stopLocation, anyCandidates);
+					}
+
+					if (nearestChargers.isEmpty()) {
+						log.warn("No compatible charger found near link {} for vehicle {}. Skipping this charging stop.", stopLocation.getId(), evId);
+						continue;
+					}
+
+					ChargerSpecification selectedCharger = nearestChargers.get(0);
 					Link selectedChargerLink = network.getLinks().get(selectedCharger.getLinkId());
 					Facility nexttoFacility = new LinkWrapperFacility(selectedChargerLink);
 					if (nexttoFacility.getLinkId().equals(lastFrom.getLinkId())) {
 						continue;
 					}
+
 					List<? extends PlanElement> routeSegment = delegate.calcRoute(DefaultRoutingRequest.of(lastFrom, nexttoFacility,
 							lastArrivaltime, person, request.getAttributes()));
-					Leg lastLeg = (Leg)routeSegment.get(0);
-					lastArrivaltime = lastLeg.getDepartureTime().seconds() + lastLeg.getTravelTime().seconds();
-					stagedRoute.add(lastLeg);
+
+					if (routeSegment.isEmpty()) {
+						log.warn("Routing from {} to charger {} produced an empty leg list. Skipping this charging stop.", lastFrom.getLinkId(),
+								selectedCharger.getLinkId());
+						continue;
+					}
+
+					for (PlanElement planElement : routeSegment) {
+						if (planElement instanceof Leg) {
+							Leg leg = (Leg) planElement;
+							lastArrivaltime = leg.getDepartureTime().seconds() + leg.getTravelTime().seconds();
+						}
+						stagedRoute.add(planElement);
+					}
+
 					Activity chargeAct = PopulationUtils.createStageActivityFromCoordLinkIdAndModePrefix(selectedChargerLink.getCoord(),
 							selectedChargerLink.getId(), stageActivityModePrefix);
-					// createStageActivity... creates a InteractionActivity where duration cannot be set.
 					chargeAct = PopulationUtils.createActivity(chargeAct);
-					// assume that the battery is compatible with a power that allows for full charge within one hour (cf. FixedSpeedCharging)
 					double maxPowerEstimate = Math.min(selectedCharger.getPlugPower(), evspecs.getBatteryCapacity() / 3600);
 					double estimatedChargingTime = (evspecs.getBatteryCapacity() * 1.5) / maxPowerEstimate;
 					chargeAct.setMaximumDuration(Math.max(evConfigGroup.minimumChargeTime, estimatedChargingTime));
@@ -192,6 +223,14 @@ final class EvNetworkRoutingModule implements RoutingModule {
 			}
 
 		}
+	}
+
+	private double drawConsumptionBudget(double availableEnergy, double batteryCapacity) {
+		double triggerFraction = 0.2 + random.nextDouble() * 0.15;
+		double targetResidual = batteryCapacity * triggerFraction;
+		double budget = availableEnergy - targetResidual;
+		double minBudget = Math.max(batteryCapacity * 0.05, 1.0);
+		return Math.max(budget, minBudget);
 	}
 
 	private Map<Link, Double> estimateConsumption(ElectricVehicleSpecification ev, Leg basicLeg) {

@@ -22,6 +22,8 @@ import org.matsim.core.mobsim.qsim.InternalInterface;
 import org.matsim.core.mobsim.qsim.QSim;
 import org.matsim.core.mobsim.qsim.interfaces.MobsimEngine;
 import org.matsim.vehicles.Vehicle;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.Map;
 import java.util.Queue;
@@ -36,6 +38,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public final class DriveDischargingHandler
 		implements LinkLeaveEventHandler, VehicleEntersTrafficEventHandler, VehicleLeavesTrafficEventHandler,
 		MobsimScopeEventHandler, MobsimEngine {
+	private static final Logger LOG = LogManager.getLogger(DriveDischargingHandler.class);
 
 	private static class EvDrive {
 		private final Id<Vehicle> vehicleId;
@@ -50,13 +53,33 @@ public final class DriveDischargingHandler
 		boolean isOnFirstLink() { return Double.isNaN(movedOverNodeTime); }
 	}
 
+	private static final class LinkLeaveRecord {
+		private final LinkLeaveEvent event;
+		private final EvDrive evDrive;
+
+		private LinkLeaveRecord(LinkLeaveEvent event, EvDrive evDrive) {
+			this.event = event;
+			this.evDrive = evDrive;
+		}
+	}
+
+	private static final class TrafficLeaveRecord {
+		private final VehicleLeavesTrafficEvent event;
+		private final EvDrive evDrive;
+
+		private TrafficLeaveRecord(VehicleLeavesTrafficEvent event, EvDrive evDrive) {
+			this.event = event;
+			this.evDrive = evDrive;
+		}
+	}
+
 	private final Network network;
 	private final EventsManager eventsManager;
 	private final Map<Id<Vehicle>, ? extends ElectricVehicle> eVehicles;
 	private final Map<Id<Vehicle>, EvDrive> evDrives;
 
-	private final Queue<LinkLeaveEvent> linkLeaveEvents = new ConcurrentLinkedQueue<>();
-	private final Queue<VehicleLeavesTrafficEvent> trafficLeaveEvents = new ConcurrentLinkedQueue<>();
+	private final Queue<LinkLeaveRecord> linkLeaveEvents = new ConcurrentLinkedQueue<>();
+	private final Queue<TrafficLeaveRecord> trafficLeaveEvents = new ConcurrentLinkedQueue<>();
 
 	private final QSim qsim;
 
@@ -77,14 +100,16 @@ public final class DriveDischargingHandler
 	}
 
 	@Override public void handleEvent(LinkLeaveEvent event) {
-		if (evDrives.containsKey(event.getVehicleId())) {
-			linkLeaveEvents.add(event);
+		var evDrive = evDrives.get(event.getVehicleId());
+		if (evDrive != null) {
+			linkLeaveEvents.add(new LinkLeaveRecord(event, evDrive));
 		}
 	}
 
 	@Override public void handleEvent(VehicleLeavesTrafficEvent event) {
-		if (evDrives.containsKey(event.getVehicleId())) {
-			trafficLeaveEvents.add(event);
+		var evDrive = evDrives.get(event.getVehicleId());
+		if (evDrive != null) {
+			trafficLeaveEvents.add(new TrafficLeaveRecord(event, evDrive));
 		}
 	}
 
@@ -102,28 +127,35 @@ public final class DriveDischargingHandler
 		handleLeavesTrafficEvents(trafficLeaveEvents, time);
 	}
 
-	private void handleLinkLeaveEvents(Queue<LinkLeaveEvent> queue, double now) {
+	private void handleLinkLeaveEvents(Queue<LinkLeaveRecord> queue, double now) {
 		while (!queue.isEmpty()) {
-			var event = queue.peek();
+			var record = queue.peek();
+			var event = record.event;
 			if (event.getTime() == now) break; // process only from previous timestep
-			var evDrive = dischargeVehicle(event.getVehicleId(), event.getLinkId(), event.getTime(), now);
-			evDrive.movedOverNodeTime = event.getTime();
+			dischargeVehicle(record.evDrive, event.getLinkId(), event.getTime(), now);
+			record.evDrive.movedOverNodeTime = event.getTime();
 			queue.remove();
 		}
 	}
 
-	private void handleLeavesTrafficEvents(Queue<VehicleLeavesTrafficEvent> queue, double now) {
+	private void handleLeavesTrafficEvents(Queue<TrafficLeaveRecord> queue, double now) {
 		while (!queue.isEmpty()) {
-			var event = queue.peek();
+			var record = queue.peek();
+			var event = record.event;
 			if (event.getTime() == now) break; // process only from previous timestep
-			var evDrive = dischargeVehicle(event.getVehicleId(), event.getLinkId(), event.getTime(), now);
-			evDrives.remove(evDrive.vehicleId);
+			var evDrive = record.evDrive;
+			if (evDrive == null) {
+				LOG.error("Vehicle {} left traffic without drive state; telemetry lost for link {} at {}s.",
+						event.getVehicleId(), event.getLinkId(), event.getTime());
+			} else {
+				dischargeVehicle(evDrive, event.getLinkId(), event.getTime(), now);
+				evDrives.remove(evDrive.vehicleId);
+			}
 			queue.remove();
 		}
 	}
 
-	private EvDrive dischargeVehicle(Id<Vehicle> vehicleId, Id<Link> linkId, double eventTime, double now) {
-		var evDrive = evDrives.get(vehicleId);
+	private void dischargeVehicle(EvDrive evDrive, Id<Link> linkId, double eventTime, double now) {
 		if (!evDrive.isOnFirstLink()) { // skip the first link
 			Link link = network.getLinks().get(linkId);
 			double tt = eventTime - evDrive.movedOverNodeTime;
@@ -137,9 +169,8 @@ public final class DriveDischargingHandler
 			ev.getBattery().dischargeEnergy(energy, missing ->
 					eventsManager.processEvent(new MissingEnergyEvent(now, ev.getId(), link.getId(), missing)));
 
-			eventsManager.processEvent(new DrivingEnergyConsumptionEvent(now, vehicleId, linkId,
+			eventsManager.processEvent(new DrivingEnergyConsumptionEvent(now, evDrive.vehicleId, linkId,
 					energy, ev.getBattery().getCharge()));
 		}
-		return evDrive;
 	}
 }
