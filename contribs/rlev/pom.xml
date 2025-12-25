@@ -33,7 +33,7 @@
 
     <!-- Plugins -->
     <compiler.plugin.version>3.11.0</compiler.plugin.version>
-    <shade.plugin.version>3.5.0</shade.plugin.version>
+    <shade.plugin.version>3.6.1</shade.plugin.version>
     <enforcer.plugin.version>3.5.0</enforcer.plugin.version>
   </properties>
 
